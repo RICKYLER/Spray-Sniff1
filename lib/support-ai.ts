@@ -74,6 +74,158 @@ function extractOpenAIResponseText(payload: unknown) {
   return segments.length > 0 ? segments.join('\n').trim() : null
 }
 
+function extractAnthropicResponseText(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const content = (payload as { content?: unknown }).content
+  if (!Array.isArray(content)) {
+    return null
+  }
+
+  const segments = content
+    .filter(
+      (item): item is { type: string; text: string } =>
+        Boolean(item) &&
+        typeof item === 'object' &&
+        (item as { type?: unknown }).type === 'text' &&
+        typeof (item as { text?: unknown }).text === 'string',
+    )
+    .map((item) => item.text.trim())
+    .filter(Boolean)
+
+  return segments.length > 0 ? segments.join('\n').trim() : null
+}
+
+type AgentRouterProtocol = 'anthropic' | 'openai' | 'responses'
+
+function normalizeAgentRouterBaseUrl(rawUrl?: string): string {
+  const base = (rawUrl ?? 'https://agentrouter.org').trim().replace(/\/+$/, '')
+  return base.endsWith('/v1') ? base.slice(0, -3) : base
+}
+
+function resolveAgentRouterProtocol(
+  model: string,
+  configuredProtocol?: string,
+): AgentRouterProtocol {
+  const normalized = configuredProtocol?.trim().toLowerCase()
+  if (normalized === 'anthropic' || normalized === 'openai' || normalized === 'responses') {
+    return normalized
+  }
+
+  if (model.startsWith('claude-')) {
+    return 'anthropic'
+  }
+  if (model.startsWith('gpt-')) {
+    return 'responses'
+  }
+  return 'openai'
+}
+
+export interface AgentRouterCallResult {
+  text: string
+  rawText: string
+  model: string
+  protocol: AgentRouterProtocol
+}
+
+export async function callAgentRouter(options: {
+  system: string
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>
+  modelOverride?: string
+}): Promise<AgentRouterCallResult | null> {
+  const apiKey = getOptionalServerEnv('AGENTROUTER_API_KEY')
+  if (!apiKey) {
+    return null
+  }
+
+  const baseUrl = normalizeAgentRouterBaseUrl(getOptionalServerEnv('AGENTROUTER_BASE_URL'))
+  const primaryModel = options.modelOverride ?? getOptionalServerEnv('AGENTROUTER_MODEL') ?? 'gpt-6.1-sol'
+  const configuredProtocol = getOptionalServerEnv('AGENTROUTER_PROTOCOL')
+
+  const fallbackPool = ['gpt-6.1-sol', 'gpt-5.6-sol', 'deepseek-v4-flash', 'claude-opus-5']
+  const candidateModels = options.modelOverride
+    ? [options.modelOverride]
+    : Array.from(new Set([primaryModel, ...fallbackPool]))
+
+  for (const model of candidateModels) {
+    const protocol = resolveAgentRouterProtocol(model, configuredProtocol)
+    const endpoint =
+      protocol === 'anthropic'
+        ? `${baseUrl}/v1/messages`
+        : protocol === 'responses'
+          ? `${baseUrl}/v1/responses`
+          : `${baseUrl}/v1/chat/completions`
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      // AgentRouter enforces client validation; a recognized harness User-Agent is required.
+      'User-Agent': 'cline/3.0.0',
+    }
+
+    let body: Record<string, unknown>
+
+    if (protocol === 'anthropic') {
+      headers['x-api-key'] = apiKey
+      headers['anthropic-version'] = '2023-06-01'
+      body = {
+        model,
+        max_tokens: 512,
+        system: options.system,
+        messages: options.messages,
+      }
+    } else if (protocol === 'responses') {
+      headers.Authorization = `Bearer ${apiKey}`
+      body = {
+        model,
+        instructions: options.system,
+        input: options.messages,
+      }
+    } else {
+      headers.Authorization = `Bearer ${apiKey}`
+      body = {
+        model,
+        messages: [{ role: 'system', content: options.system }, ...options.messages],
+        stream: false,
+      }
+    }
+
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        cache: 'no-store',
+        signal: AbortSignal.timeout(8000),
+      })
+
+      if (!response.ok) {
+        continue
+      }
+
+      const data = await response.json().catch(() => null)
+      const extracted =
+        protocol === 'anthropic'
+          ? extractAnthropicResponseText(data)
+          : extractOpenAIResponseText(data)
+
+      if (extracted) {
+        return {
+          text: cleanBotResponseText(compactText(extracted)),
+          rawText: extracted.trim(),
+          model,
+          protocol,
+        }
+      }
+    } catch {
+      // Try next candidate model or fall back to secondary provider
+    }
+  }
+
+  return null
+}
+
 export interface ConciergeChatInput {
   userMessage: string
   customerName?: string
@@ -93,27 +245,17 @@ export interface ConciergeChatInput {
 export function isHumanEscalationRequest(text: string): boolean {
   const normalized = text.toLowerCase()
   return (
-    normalized.includes('admin') ||
-    normalized.includes('human') ||
-    normalized.includes('agent') ||
-    normalized.includes('staff') ||
+    /\b(admin|human|agent|staff|tao|tawo|ticket|representative|reklamo|complaint|guba|damaged|dispute)\b/i.test(
+      normalized,
+    ) ||
     normalized.includes('live support') ||
-    normalized.includes('tao') ||
-    normalized.includes('tawo') ||
     normalized.includes('istorya sa tao') ||
     normalized.includes('makigstorya') ||
     normalized.includes('kaistorya') ||
     normalized.includes('ka-istorya') ||
-    normalized.includes('reklamo') ||
-    normalized.includes('complaint') ||
-    normalized.includes('ticket') ||
-    normalized.includes('representative') ||
     normalized.includes('dili kasabot') ||
     normalized.includes('dili makaya') ||
-    normalized.includes('guba') ||
-    normalized.includes('damaged') ||
-    normalized.includes('wrong item') ||
-    normalized.includes('dispute')
+    normalized.includes('wrong item')
   )
 }
 
@@ -139,15 +281,15 @@ export function cleanBotResponseText(rawText: string): string {
   )
 }
 
-export async function generateConciergeChatReply(input: ConciergeChatInput): Promise<string | null> {
-  const ollamaKey = getOptionalServerEnv('OLLAMA_API_KEY')
-  if (!ollamaKey) {
-    return null
-  }
+export interface ConciergeReplyResult {
+  text: string
+  provider: 'agentrouter' | 'ollama'
+  model: string
+}
 
-  const host = getOptionalServerEnv('OLLAMA_HOST') ?? 'https://ollama.com'
-  const model = getOptionalServerEnv('OLLAMA_MODEL') ?? 'gemma4:31b-cloud'
-
+export async function generateConciergeChatReplyWithMeta(
+  input: ConciergeChatInput,
+): Promise<ConciergeReplyResult | null> {
   const systemPrompt = `You are the Senior Fragrance Consultant & Concierge at Spray & Sniff, an artisanal luxury perfume atelier in Mabini, Manila.
 
 STYLE & FORMATTING REQUIREMENTS (VERY STRICT):
@@ -169,13 +311,11 @@ ATELIER SIGNATURES:
 LANGUAGE:
 If addressed in Cebuano/Bisaya or Tagalog, reply fluently and naturally in that language with the same warm luxury boutique grace. Never invent fake tracking numbers or personal order data.`
 
-  const messages: Array<{ role: string; content: string }> = [
-    { role: 'system', content: systemPrompt },
-  ]
+  const chatMessages: Array<{ role: 'user' | 'assistant'; content: string }> = []
 
   if (input.conversationHistory && input.conversationHistory.length > 0) {
     for (const msg of input.conversationHistory.slice(-4)) {
-      messages.push({
+      chatMessages.push({
         role: msg.role === 'user' ? 'user' : 'assistant',
         content: msg.content,
       })
@@ -187,14 +327,44 @@ If addressed in Cebuano/Bisaya or Tagalog, reply fluently and naturally in that 
     userPromptParts.push(`Customer: ${input.customerName}`)
   }
   if (input.orderContext) {
-    userPromptParts.push(`Order Context: ${input.orderContext.id} (${input.orderContext.status}, payment: ${input.orderContext.paymentStatus ?? 'pending'})`)
+    userPromptParts.push(
+      `Order Context: ${input.orderContext.id} (${input.orderContext.status}, payment: ${input.orderContext.paymentStatus ?? 'pending'})`,
+    )
   }
   userPromptParts.push(`Message: ${input.userMessage}`)
 
-  messages.push({
+  chatMessages.push({
     role: 'user',
     content: userPromptParts.join('\n'),
   })
+
+  // 1. Primary provider: AgentRouter
+  const agentRouterResult = await callAgentRouter({
+    system: systemPrompt,
+    messages: chatMessages,
+  })
+
+  if (agentRouterResult) {
+    return {
+      text: agentRouterResult.text,
+      provider: 'agentrouter',
+      model: agentRouterResult.model,
+    }
+  }
+
+  // 2. Fallback provider: Ollama Cloud
+  const ollamaKey = getOptionalServerEnv('OLLAMA_API_KEY')
+  if (!ollamaKey) {
+    return null
+  }
+
+  const host = getOptionalServerEnv('OLLAMA_HOST') ?? 'https://ollama.com'
+  const model = getOptionalServerEnv('OLLAMA_MODEL') ?? 'gemma4:31b-cloud'
+
+  const messages: Array<{ role: string; content: string }> = [
+    { role: 'system', content: systemPrompt },
+    ...chatMessages,
+  ]
 
   try {
     const response = await fetch(`${host.replace(/\/$/, '')}/v1/chat/completions`, {
@@ -217,15 +387,468 @@ If addressed in Cebuano/Bisaya or Tagalog, reply fluently and naturally in that 
 
     const data = await response.json().catch(() => null)
     const reply = data?.choices?.[0]?.message?.content
-    return typeof reply === 'string' && reply.trim()
-      ? cleanBotResponseText(compactText(reply))
-      : null
+    if (typeof reply === 'string' && reply.trim()) {
+      return {
+        text: cleanBotResponseText(compactText(reply)),
+        provider: 'ollama',
+        model,
+      }
+    }
+    return null
   } catch {
     return null
   }
 }
 
+export async function generateConciergeChatReply(input: ConciergeChatInput): Promise<string | null> {
+  const result = await generateConciergeChatReplyWithMeta(input)
+  return result?.text ?? null
+}
+
+export interface ConciergeProductContext {
+  id: string
+  name: string
+  category: string
+  price: number
+  notes?: string[]
+  description?: string
+  featured?: boolean
+}
+
+export interface ConciergeTurnInput {
+  userMessage: string
+  customerName?: string
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>
+  products?: ConciergeProductContext[]
+  orders?: Array<{
+    id: string
+    status: string
+    paymentStatus?: string
+    total: number
+    courier?: string | null
+    trackingNumber?: string | null
+  }>
+  selectedOrderId?: string
+}
+
+export interface ConciergeTurnResult {
+  reply: string
+  escalate: boolean
+  category: SupportCategory
+  reason?: string
+  provider: 'agentrouter' | 'ollama' | 'concierge-fallback'
+  model?: string
+}
+
+function normalizeSupportCategory(raw?: unknown): SupportCategory {
+  if (
+    raw === 'order_help' ||
+    raw === 'payment_issue' ||
+    raw === 'refund_request' ||
+    raw === 'general'
+  ) {
+    return raw
+  }
+  return 'general'
+}
+
+function parseStructuredConciergeResponse(
+  rawText: string,
+): { reply: string; escalate: boolean; category: SupportCategory; reason?: string } {
+  const trimmed = rawText.trim()
+  const jsonCandidate = trimmed
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim()
+
+  if (jsonCandidate.startsWith('{') && jsonCandidate.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(jsonCandidate) as Record<string, unknown>
+      if (typeof parsed.reply === 'string' && parsed.reply.trim()) {
+        return {
+          reply: cleanBotResponseText(compactText(parsed.reply)),
+          escalate: Boolean(parsed.escalate),
+          category: normalizeSupportCategory(parsed.category),
+          reason: typeof parsed.reason === 'string' && parsed.reason.trim() ? parsed.reason.trim() : undefined,
+        }
+      }
+    } catch {
+      // Fall back to plain-text parsing
+    }
+  }
+
+  const hasEscalateMarker = /\[ESCALATE_TO_ADMIN\]/i.test(trimmed)
+  const cleaned = cleanBotResponseText(
+    compactText(trimmed.replace(/\[ESCALATE_TO_ADMIN\]/gi, '')),
+  )
+
+  return {
+    reply: cleaned,
+    escalate: hasEscalateMarker,
+    category: 'general',
+  }
+}
+
+function detectSevereIssueCategory(text: string): SupportCategory | null {
+  const normalized = text.toLowerCase()
+  if (
+    normalized.includes('refund') ||
+    normalized.includes('uli') ||
+    normalized.includes('damaged') ||
+    normalized.includes('broken') ||
+    normalized.includes('leaked') ||
+    normalized.includes('basag') ||
+    normalized.includes('guba') ||
+    normalized.includes('wrong item') ||
+    normalized.includes('missing item') ||
+    normalized.includes('kulang')
+  ) {
+    return 'refund_request'
+  }
+  if (
+    normalized.includes('payment failed') ||
+    normalized.includes('charged twice') ||
+    normalized.includes('double charge') ||
+    normalized.includes('not reflected') ||
+    normalized.includes('wala ni reflect') ||
+    normalized.includes('gcash problem') ||
+    normalized.includes('paymongo error')
+  ) {
+    return 'payment_issue'
+  }
+  if (
+    normalized.includes('cancel') ||
+    normalized.includes('change address') ||
+    normalized.includes('lost parcel') ||
+    normalized.includes('stuck') ||
+    normalized.includes('wala naabot') ||
+    normalized.includes('dispute') ||
+    normalized.includes('complaint') ||
+    normalized.includes('reklamo')
+  ) {
+    return 'order_help'
+  }
+  return null
+}
+
+function isGreetingMessage(text: string): boolean {
+  const normalized = text.toLowerCase().trim()
+  return /^(h+i+|hello+|hey+|good\s*(morning|afternoon|evening)|kamusta|kumusta|maayong\s*(buntag|hapon|gabii)|yo+)[\s!?.]*$/i.test(
+    normalized,
+  )
+}
+
+function isPerfumeQuery(text: string): boolean {
+  const normalized = text.toLowerCase()
+  return (
+    normalized.includes('perfume') ||
+    normalized.includes('scent') ||
+    normalized.includes('fragrance') ||
+    normalized.includes('pabango') ||
+    normalized.includes('humot') ||
+    normalized.includes('best') ||
+    normalized.includes('recommend') ||
+    normalized.includes('suggest') ||
+    normalized.includes('popular') ||
+    normalized.includes('floral') ||
+    normalized.includes('woody') ||
+    normalized.includes('fresh') ||
+    normalized.includes('citrus') ||
+    normalized.includes('vanilla') ||
+    normalized.includes('musk') ||
+    normalized.includes('evening') ||
+    normalized.includes('date') ||
+    normalized.includes('gift') ||
+    normalized.includes('price') ||
+    normalized.includes('how much') ||
+    normalized.includes('tagpila')
+  )
+}
+
+function isPolicyOrOrderQuery(text: string): boolean {
+  const normalized = text.toLowerCase()
+  return (
+    normalized.includes('ship') ||
+    normalized.includes('deliver') ||
+    normalized.includes('eta') ||
+    normalized.includes('track') ||
+    normalized.includes('order') ||
+    normalized.includes('return') ||
+    normalized.includes('payment') ||
+    normalized.includes('gcash') ||
+    normalized.includes('maya') ||
+    normalized.includes('qr') ||
+    normalized.includes('paymongo') ||
+    normalized.includes('cod')
+  )
+}
+
+export function buildLocalConciergeFallback(input: ConciergeTurnInput): ConciergeTurnResult {
+  const text = input.userMessage.trim()
+  const greetingName = input.customerName ? ` ${input.customerName}` : ''
+  const severeCategory = detectSevereIssueCategory(text)
+
+  if (isHumanEscalationRequest(text) || severeCategory) {
+    const category = severeCategory ?? (input.selectedOrderId ? 'order_help' : 'general')
+    return {
+      reply:
+        'I understand this requires direct assistance from our team. I am handing your conversation and details over to a Live Admin now so our staff can resolve this promptly for you.',
+      escalate: true,
+      category,
+      reason: isHumanEscalationRequest(text)
+        ? 'Customer requested human admin assistance'
+        : `Detected ${category} issue requiring admin review`,
+      provider: 'concierge-fallback',
+    }
+  }
+
+  if (isGreetingMessage(text)) {
+    return {
+      reply: `Hello${greetingName}, welcome to Spray & Sniff Atelier. I am your Fragrance Concierge and I can help you choose a signature scent, check delivery timelines, or look up your orders anytime.`,
+      escalate: false,
+      category: 'general',
+      provider: 'concierge-fallback',
+    }
+  }
+
+  if (isPerfumeQuery(text)) {
+    const catalog = input.products ?? []
+    const lower = text.toLowerCase()
+    const matching = catalog.filter((item) => {
+      const haystack = `${item.name} ${item.category} ${(item.notes ?? []).join(' ')} ${item.description ?? ''}`.toLowerCase()
+      return lower
+        .split(/\s+/)
+        .some((word) => word.length > 3 && haystack.includes(word))
+    })
+
+    const picks = (matching.length > 0 ? matching : catalog.filter((p) => p.featured).length > 0 ? catalog.filter((p) => p.featured) : catalog).slice(0, 3)
+
+    if (picks.length > 0) {
+      const summary = picks
+        .map((p) => {
+          const notesPart = p.notes && p.notes.length > 0 ? ` featuring ${p.notes.slice(0, 3).join(', ')}` : ''
+          return `${p.name} (PHP ${p.price.toLocaleString()}${notesPart})`
+        })
+        .join('; ')
+
+      return {
+        reply: `Our signature favorites from the atelier include ${summary}. You can also take our Fragrance Match Quiz at /discovery to find the scent that best fits your mood or occasion.`,
+        escalate: false,
+        category: 'general',
+        provider: 'concierge-fallback',
+      }
+    }
+
+    return {
+      reply:
+        'Our most requested signatures are Midnight Elegance for warm evening occasions, Azure Bloom for crisp daytime freshness, and Velvet Santal for a refined unisex woody profile. You can also try our Fragrance Match Quiz at /discovery for a tailored recommendation.',
+      escalate: false,
+      category: 'general',
+      provider: 'concierge-fallback',
+    }
+  }
+
+  if (isPolicyOrOrderQuery(text)) {
+    const orders = input.orders ?? []
+    const targetOrder =
+      (input.selectedOrderId ? orders.find((o) => o.id === input.selectedOrderId) : undefined) ??
+      orders[0]
+
+    if (text.toLowerCase().includes('order') || text.toLowerCase().includes('track')) {
+      if (targetOrder) {
+        const trackingInfo = targetOrder.trackingNumber
+          ? ` with tracking ${targetOrder.trackingNumber}${targetOrder.courier ? ` via ${targetOrder.courier}` : ''}`
+          : ''
+        return {
+          reply: `Your order ${targetOrder.id} is currently ${targetOrder.status} (payment: ${targetOrder.paymentStatus ?? 'pending'}${trackingInfo}). Delivery takes 2 to 3 business days within Metro Manila and 3 to 5 business days for provincial addresses.`,
+          escalate: false,
+          category: 'order_help',
+          provider: 'concierge-fallback',
+        }
+      }
+    }
+
+    return {
+      reply:
+        'Delivery takes 2 to 3 business days within Metro Manila and 3 to 5 business days for provincial addresses, and we accept PayMongo (GCash, Maya, QR Ph, cards) with a 7-day return window for sealed bottles. Feel free to ask if you have a specific order question.',
+      escalate: false,
+      category: 'general',
+      provider: 'concierge-fallback',
+    }
+  }
+
+  // If the user has already chatted multiple turns and still has an unrecognized or complex request, hand over to Admin.
+  const assistantTurns = (input.history ?? []).filter((m) => m.role === 'assistant').length
+  if (assistantTurns >= 2) {
+    return {
+      reply:
+        'I want to make sure your concern is handled thoroughly, so I am handing our conversation over to a Live Admin right now. Our team can review everything we discussed and assist you directly.',
+      escalate: true,
+      category: input.selectedOrderId ? 'order_help' : 'general',
+      reason: 'Bot reached fallback escalation limit after unresolved customer inquiry',
+      provider: 'concierge-fallback',
+    }
+  }
+
+  return {
+    reply:
+      'I would be glad to help with fragrance recommendations, pricing, delivery timelines, or checking your orders. Could you share a bit more detail about what you need, or let me know if you would like me to connect you to a Live Admin?',
+    escalate: false,
+    category: 'general',
+    provider: 'concierge-fallback',
+  }
+}
+
+export async function runConciergeChatTurn(input: ConciergeTurnInput): Promise<ConciergeTurnResult> {
+  if (isHumanEscalationRequest(input.userMessage)) {
+    const category = detectSevereIssueCategory(input.userMessage) ?? (input.selectedOrderId ? 'order_help' : 'general')
+    return {
+      reply:
+        'I understand you would like direct assistance from our team. I am handing this conversation over to a Live Admin now along with your chat details.',
+      escalate: true,
+      category,
+      reason: 'Customer requested human admin or reported an escalation keyword',
+      provider: 'concierge-fallback',
+    }
+  }
+
+  const catalogSnippet = (input.products ?? [])
+    .slice(0, 12)
+    .map(
+      (p) =>
+        `${p.name} (${p.category}, PHP ${p.price}${p.notes?.length ? `, notes: ${p.notes.slice(0, 4).join(', ')}` : ''})`,
+    )
+    .join(' | ')
+
+  const ordersSnippet = (input.orders ?? [])
+    .slice(0, 5)
+    .map(
+      (o) =>
+        `${o.id}: status=${o.status}, payment=${o.paymentStatus ?? 'pending'}, total=PHP ${o.total}${o.trackingNumber ? `, tracking=${o.trackingNumber}` : ''}`,
+    )
+    .join(' | ')
+
+  const systemPrompt = `You are the Senior Fragrance Consultant & AI Concierge at Spray & Sniff, an artisanal luxury perfume atelier in Mabini, Manila.
+
+YOUR ROLE:
+You handle customers FIRST. Answer greetings, perfume recommendations, scent advice, product pricing, delivery timelines, store policies, and simple order status lookups yourself.
+ONLY escalate to a human Admin when you genuinely CANNOT solve the customer's problem (for example: damaged, leaked, or wrong items received; manual refund or payment verification discrepancies; lost parcels; address changes after dispatch; disputes/complaints; or if the customer asks for a human/admin).
+
+RESPONSE FORMAT (STRICT JSON):
+Return ONLY valid JSON with no markdown code fences:
+{"reply":"Your warm, concise response (2 to 3 sentences, plain text only, NO asterisks, NO hashtags, NO bullet points, NO double dashes)","escalate":false,"category":"general","reason":""}
+
+Valid values for "category": "general", "order_help", "payment_issue", "refund_request".
+Set "escalate": true ONLY when human admin intervention is required.
+
+LIVE ATELIER CATALOG:
+${catalogSnippet || 'Midnight Elegance, Azure Bloom, Velvet Santal, Solar Neroli'}
+
+CUSTOMER ORDERS:
+${ordersSnippet || 'No recent orders on file'}
+
+POLICIES & LANGUAGE:
+- Delivery: 2 to 3 business days within Metro Manila, 3 to 5 business days provincial.
+- Returns: Sealed bottles within 7 days. Fragrance Match Quiz at /discovery.
+- Reply in English, Tagalog, or Cebuano/Bisaya matching the customer's language with warm luxury poise. Never invent tracking numbers or fake order data.`
+
+  const chatMessages: Array<{ role: 'user' | 'assistant'; content: string }> = []
+  if (input.history && input.history.length > 0) {
+    for (const turn of input.history.slice(-6)) {
+      chatMessages.push({
+        role: turn.role,
+        content: turn.content,
+      })
+    }
+  }
+
+  const userParts: string[] = []
+  if (input.customerName) {
+    userParts.push(`Customer: ${input.customerName}`)
+  }
+  if (input.selectedOrderId) {
+    userParts.push(`Selected Order: ${input.selectedOrderId}`)
+  }
+  userParts.push(`Message: ${input.userMessage}`)
+  chatMessages.push({ role: 'user', content: userParts.join('\n') })
+
+  // 1. Primary provider: AgentRouter
+  const arResult = await callAgentRouter({
+    system: systemPrompt,
+    messages: chatMessages,
+  })
+
+  if (arResult) {
+    const parsed = parseStructuredConciergeResponse(arResult.rawText)
+    if (parsed.reply) {
+      return {
+        ...parsed,
+        provider: 'agentrouter',
+        model: arResult.model,
+      }
+    }
+  }
+
+  // 2. Secondary provider: Ollama Cloud
+  const ollamaKey = getOptionalServerEnv('OLLAMA_API_KEY')
+  if (ollamaKey) {
+    const host = getOptionalServerEnv('OLLAMA_HOST') ?? 'https://ollama.com'
+    const model = getOptionalServerEnv('OLLAMA_MODEL') ?? 'gemma4:31b-cloud'
+
+    try {
+      const response = await fetch(`${host.replace(/\/$/, '')}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${ollamaKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'system', content: systemPrompt }, ...chatMessages],
+          stream: false,
+        }),
+        cache: 'no-store',
+        signal: AbortSignal.timeout(8000),
+      })
+
+      if (response.ok) {
+        const data = await response.json().catch(() => null)
+        const rawReply = data?.choices?.[0]?.message?.content
+        if (typeof rawReply === 'string' && rawReply.trim()) {
+          const parsed = parseStructuredConciergeResponse(rawReply)
+          if (parsed.reply) {
+            return {
+              ...parsed,
+              provider: 'ollama',
+              model,
+            }
+          }
+        }
+      }
+    } catch {
+      // Fall through to catalog-aware local concierge fallback
+    }
+  }
+
+  // 3. Guaranteed non-silent fallback using live catalog and order context
+  return buildLocalConciergeFallback(input)
+}
+
 async function maybeGenerateAISummary({ fallback, intent, payload }: AISummaryRequest) {
+  const summarySystemPrompt =
+    'You are the concise Spray & Sniff perfume concierge in Mabini atelier. Use only the provided JSON facts. Never invent data or statuses. Keep the response to 2 short sentences.'
+  const summaryUserPrompt = `Intent: ${intent}\nFacts:\n${JSON.stringify(payload, null, 2)}`
+
+  // 1. Primary provider: AgentRouter
+  const agentRouterResult = await callAgentRouter({
+    system: summarySystemPrompt,
+    messages: [{ role: 'user', content: summaryUserPrompt }],
+  })
+
+  if (agentRouterResult) {
+    return agentRouterResult.text
+  }
+
   const ollamaKey = getOptionalServerEnv('OLLAMA_API_KEY')
   const openAiKey = getOptionalServerEnv('OPENAI_API_KEY')
 
@@ -249,12 +872,11 @@ async function maybeGenerateAISummary({ fallback, intent, payload }: AISummaryRe
           messages: [
             {
               role: 'system',
-              content:
-                'You are the concise Spray & Sniff perfume concierge in Mabini atelier. Use only the provided JSON facts. Never invent data or statuses. Keep the response to 2 short sentences.',
+              content: summarySystemPrompt,
             },
             {
               role: 'user',
-              content: `Intent: ${intent}\nFacts:\n${JSON.stringify(payload, null, 2)}`,
+              content: summaryUserPrompt,
             },
           ],
           stream: false,

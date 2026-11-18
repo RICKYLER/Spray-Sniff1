@@ -1,7 +1,7 @@
 'use client'
 
-import { useMemo, useState } from 'react'
-import { Package, ShieldAlert, CheckCircle2, Search, Loader2 } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { Package, ShieldAlert, CheckCircle2, Search, Loader2, Tag, Info } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -30,12 +30,23 @@ import {
   type OrderStatus,
   useStore,
 } from '@/lib/store-context'
+import { getBrowserAuthHeaders } from '@/lib/client-auth-headers'
 import { toast } from '@/hooks/use-toast'
 
 interface AdminDeliveryDialogProps {
   order: OrderRecord | null
   open: boolean
   onOpenChange: (open: boolean) => void
+}
+
+interface CarrierCatalogMatch {
+  slug: string
+  name: string
+  input_requirements?: {
+    required?: string[]
+    any_of?: string[]
+    conditional?: string[]
+  }
 }
 
 const DELIVERY_STATUS_RANK: Record<string, number> = {
@@ -71,6 +82,7 @@ export function AdminDeliveryDialog({ order, open, onOpenChange }: AdminDelivery
   )
 
   const [courier, setCourier] = useState(order?.courier ?? '')
+  const [courierSlug, setCourierSlug] = useState(order?.courierSlug ?? '')
   const [trackingNumber, setTrackingNumber] = useState(order?.trackingNumber ?? '')
   const [deliveryNotes, setDeliveryNotes] = useState(order?.deliveryNotes ?? '')
   const [status, setStatus] = useState<OrderStatus | ''>(() => getSelectableStatuses(order?.status ?? 'Pending')[0] ?? '')
@@ -78,9 +90,64 @@ export function AdminDeliveryDialog({ order, open, onOpenChange }: AdminDelivery
   const [confirming, setConfirming] = useState(false)
   const [isCheckingWaybill, setIsCheckingWaybill] = useState(false)
   const [detectedCarrier, setDetectedCarrier] = useState<string | null>(null)
+  const [carrierMatches, setCarrierMatches] = useState<CarrierCatalogMatch[]>([])
+  const [isSearchingCarriers, setIsSearchingCarriers] = useState(false)
+  const [showCarrierDropdown, setShowCarrierDropdown] = useState(false)
+  const [selectedCarrierRules, setSelectedCarrierRules] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!open || !showCarrierDropdown) return
+
+    const query = courier.trim()
+    if (query.length < 2) {
+      setCarrierMatches([])
+      return
+    }
+
+    let cancelled = false
+    const timer = setTimeout(async () => {
+      setIsSearchingCarriers(true)
+      try {
+        const headers = await getBrowserAuthHeaders()
+        const res = await fetch(
+          `/api/tracking-carriers?query=${encodeURIComponent(query)}&limit=8`,
+          { headers, cache: 'no-store' },
+        )
+        const data = (await res.json().catch(() => null)) as {
+          carriers?: CarrierCatalogMatch[]
+        } | null
+        if (!cancelled && res.ok && Array.isArray(data?.carriers)) {
+          setCarrierMatches(data.carriers)
+        }
+      } catch {
+        if (!cancelled) setCarrierMatches([])
+      } finally {
+        if (!cancelled) setIsSearchingCarriers(false)
+      }
+    }, 250)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [courier, open, showCarrierDropdown])
 
   if (!order) {
     return null
+  }
+
+  const handleSelectCarrierMatch = (match: CarrierCatalogMatch) => {
+    setCourier(match.name)
+    setCourierSlug(match.slug)
+    setShowCarrierDropdown(false)
+    setCarrierMatches([])
+
+    const reqParts = [
+      ...(match.input_requirements?.required ?? []),
+      ...(match.input_requirements?.any_of ?? []).map((f) => `${f} (any)`),
+      ...(match.input_requirements?.conditional ?? []).map((f) => `${f} (conditional)`),
+    ]
+    setSelectedCarrierRules(reqParts.length > 0 ? `Carrier requires: ${reqParts.join(', ')}` : null)
   }
 
   const handleVerifyWaybill = async () => {
@@ -88,7 +155,7 @@ export function AdminDeliveryDialog({ order, open, onOpenChange }: AdminDelivery
     if (!trimmed) {
       toast({
         title: 'Enter a tracking number',
-        description: 'Please input a waybill number to verify with ParcelsApp.',
+        description: 'Please input a waybill number to verify with Parcels API v5.',
         variant: 'destructive',
       })
       return
@@ -98,22 +165,42 @@ export function AdminDeliveryDialog({ order, open, onOpenChange }: AdminDelivery
     setDetectedCarrier(null)
 
     try {
-      const res = await fetch(`/api/track?number=${encodeURIComponent(trimmed)}`)
+      const carrierQuery = courierSlug.trim() ? `&carrier=${encodeURIComponent(courierSlug.trim())}` : ''
+      const res = await fetch(`/api/track?number=${encodeURIComponent(trimmed)}${carrierQuery}`)
       const data = await res.json().catch(() => null)
+
+      if (!res.ok && data?.error) {
+        toast({
+          title: 'Waybill Validation Notice',
+          description: data.error,
+          variant: 'destructive',
+        })
+        return
+      }
 
       if (res.ok && data?.carrier?.name && data?.carrier?.name !== 'Courier Partner') {
         setDetectedCarrier(data.carrier.name)
         if (!courier.trim()) {
           setCourier(data.carrier.name)
         }
+        if (data.carrier.slug && !courierSlug.trim()) {
+          setCourierSlug(data.carrier.slug)
+        }
         toast({
-          title: 'Carrier Identified',
-          description: `Recognized carrier: ${data.carrier.name}`,
+          title: data.isLiveCourier ? 'Live Courier Verified' : 'Carrier Identified',
+          description: data.isLiveCourier
+            ? `${data.carrier.name} — ${data.statusText} (${data.events?.length ?? 0} scan events)`
+            : `Recognized carrier: ${data.carrier.name}`,
+        })
+      } else if (data?.isProcessing) {
+        toast({
+          title: 'Courier Lookup Queued',
+          description: 'Parcels v5 is fetching initial carrier scans. Save delivery to attach this waybill.',
         })
       } else {
         toast({
-          title: 'Waybill Registered',
-          description: 'Tracking number recorded. Live satellite events will sync once accepted by courier.',
+          title: 'Waybill Recorded',
+          description: 'Tracking number checked. Live courier scans will sync once accepted by the carrier.',
         })
       }
     } catch {
@@ -151,6 +238,7 @@ export function AdminDeliveryDialog({ order, open, onOpenChange }: AdminDelivery
       const result = await updateOrderDelivery(order.id, {
         status,
         courier,
+        courierSlug: courierSlug.trim() || undefined,
         trackingNumber,
         deliveryNotes,
       })
@@ -162,9 +250,11 @@ export function AdminDeliveryDialog({ order, open, onOpenChange }: AdminDelivery
       })
 
       if (result.ok) {
-        // Trigger initial background tracking query to ParcelsApp
         if (trackingNumber.trim()) {
-          fetch(`/api/track?number=${encodeURIComponent(trackingNumber.trim())}`).catch(() => {})
+          const carrierQuery = courierSlug.trim()
+            ? `&carrier=${encodeURIComponent(courierSlug.trim())}`
+            : ''
+          fetch(`/api/track?number=${encodeURIComponent(trackingNumber.trim())}${carrierQuery}`).catch(() => {})
         }
         onOpenChange(false)
       }
@@ -183,20 +273,70 @@ export function AdminDeliveryDialog({ order, open, onOpenChange }: AdminDelivery
               Manage Delivery — {order.id}
             </DialogTitle>
             <DialogDescription>
-              Delivery progress is visible to the customer on their tracking page. Live courier scans sync via ParcelsApp.
+              Delivery progress is visible to the customer on their tracking page. Live courier scans sync via Parcels API v5.
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4 py-2">
-            <div className="space-y-1.5">
-              <Label htmlFor="delivery-courier">Courier Partner</Label>
+            <div className="space-y-1.5 relative">
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="delivery-courier">Courier Partner</Label>
+                {courierSlug && (
+                  <span className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
+                    <Tag className="h-3 w-3" />
+                    {courierSlug}
+                  </span>
+                )}
+              </div>
               <Input
                 id="delivery-courier"
                 value={courier}
-                onChange={(event) => setCourier(event.target.value)}
-                placeholder="e.g. LBC, J&T Express, Ninja Van, Flash Express"
+                onFocus={() => setShowCarrierDropdown(true)}
+                onBlur={() => setTimeout(() => setShowCarrierDropdown(false), 180)}
+                onChange={(event) => {
+                  setCourier(event.target.value)
+                  setCourierSlug('')
+                  setSelectedCarrierRules(null)
+                  setShowCarrierDropdown(true)
+                }}
+                placeholder="Search Parcels v5 carriers (e.g. LBC, J&T Express, Ninja Van, Flash)"
                 maxLength={200}
+                autoComplete="off"
               />
+              {showCarrierDropdown && (isSearchingCarriers || carrierMatches.length > 0) && (
+                <div
+                  className="absolute left-0 right-0 top-[68px] z-50 max-h-48 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-md"
+                  data-ui="carrier-picker-dropdown"
+                >
+                  {isSearchingCarriers ? (
+                    <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Searching Parcels v5 carrier catalog...
+                    </div>
+                  ) : (
+                    carrierMatches.map((match) => (
+                      <button
+                        key={match.slug}
+                        type="button"
+                        onMouseDown={(e) => {
+                          e.preventDefault()
+                          handleSelectCarrierMatch(match)
+                        }}
+                        className="flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-left text-xs hover:bg-muted"
+                      >
+                        <span className="font-medium text-foreground">{match.name}</span>
+                        <span className="font-mono text-[11px] text-muted-foreground">{match.slug}</span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+              {selectedCarrierRules && (
+                <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <Info className="h-3 w-3 shrink-0" />
+                  {selectedCarrierRules}
+                </p>
+              )}
             </div>
 
             <div className="space-y-1.5">
@@ -213,7 +353,7 @@ export function AdminDeliveryDialog({ order, open, onOpenChange }: AdminDelivery
                   id="delivery-tracking"
                   value={trackingNumber}
                   onChange={(event) => setTrackingNumber(event.target.value)}
-                  placeholder="e.g. 9400111206213785678901, 1234567890"
+                  placeholder="e.g. 9400111206213785678901 or AWB 157-52471764"
                   maxLength={200}
                   className="flex-1"
                 />
@@ -234,7 +374,7 @@ export function AdminDeliveryDialog({ order, open, onOpenChange }: AdminDelivery
                 </Button>
               </div>
               <p className="text-xs text-muted-foreground">
-                Customers can track using this waybill or their Order ID with real-time satellite updates.
+                Customers can track using this waybill or their Order ID. Selecting a Parcels v5 courier slug improves detection accuracy.
               </p>
             </div>
 

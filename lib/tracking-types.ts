@@ -11,6 +11,14 @@ export type TrackingStatus =
 export interface TrackingEvent {
   id: string
   datetime: string
+  /** UTC offset reported by carrier (`+HH:MM` / `-HH:MM`), omitted when unknown per Parcels v5. */
+  utcOffset?: string
+  /** IANA timezone supplied by carrier when known (e.g. `Asia/Manila`). */
+  timezone?: string
+  /** Carrier milestone code when provided (e.g. `DEP`, `ARR`, `DLV`). */
+  eventCode?: string
+  /** IATA station or airport code associated with the scan. */
+  station?: string
   status: string
   stage: TrackingStatus
   location: string
@@ -35,18 +43,55 @@ export interface CourierInfo {
   externalTrackingUrl?: string
 }
 
+export interface DeliveryEstimateSummary {
+  medianDays: number
+  meanDays?: number
+  typicalDays?: {
+    min?: number
+    max?: number
+  }
+  remainingStatus?: string
+  remainingDays?: {
+    mean?: number
+    median?: number
+    min?: number
+    max?: number
+  }
+  estimatedDeliveryAt?: {
+    from?: string
+    to?: string
+  }
+  confidenceLevel?: string
+}
+
+export interface TrackingInputRequirementSummary {
+  required?: string[]
+  anyOf?: string[]
+  conditional?: string[]
+}
+
 export interface TrackingResult {
   trackingNumber: string
   carrier: CourierInfo
   status: TrackingStatus
   statusText: string
   orderId?: string
+  requestId?: string
+  isProcessing?: boolean
+  expiresAt?: string
   origin?: string
   destination?: string
+  originCode?: string
+  destinationCode?: string
+  transportMode?: string
   estimatedDelivery?: string
+  deliveryEstimate?: DeliveryEstimateSummary
   lastUpdated: string
   daysInTransit?: number
   isLiveCourier?: boolean
+  shipmentError?: string
+  acceptedFields?: string[]
+  inputRequirements?: TrackingInputRequirementSummary
   events: TrackingEvent[]
 }
 
@@ -200,4 +245,83 @@ export function mapDeliveryStageToOrderStatus(stage: TrackingStatus): string | n
     default:
       return null
   }
+}
+
+const ISO_WITH_TZ_RE = /(Z|[+-]\d{2}:\d{2})$/i
+const UTC_OFFSET_RE = /^[+-]\d{2}:\d{2}$/
+
+/**
+ * Returns an epoch timestamp (ms) suitable for chronological sorting across
+ * UTC store milestones and Parcels v5 carrier events.
+ *
+ * In Parcels API v5, `date` is local wall-clock time without a suffix. When
+ * `utcOffset` is known (`+HH:MM`), subtracting it yields true UTC. When
+ * `utcOffset` is absent, we do not treat it as true UTC for display, but
+ * fall back to a deterministic parse so event lists remain chronologically ordered.
+ */
+export function toComparableTimestampMs(datetime: string, utcOffset?: string): number {
+  const trimmed = datetime.trim()
+  if (!trimmed) return 0
+
+  if (ISO_WITH_TZ_RE.test(trimmed)) {
+    const ms = Date.parse(trimmed)
+    return Number.isNaN(ms) ? 0 : ms
+  }
+
+  if (utcOffset && UTC_OFFSET_RE.test(utcOffset.trim())) {
+    const ms = Date.parse(`${trimmed}${utcOffset.trim()}`)
+    return Number.isNaN(ms) ? 0 : ms
+  }
+
+  // Fallback for unknown-offset local timestamps (Philippines store default +08:00)
+  const ms = Date.parse(`${trimmed}+08:00`)
+  return Number.isNaN(ms) ? 0 : ms
+}
+
+/**
+ * Formats a Parcels v5 tracking event timestamp for UI display without violating
+ * v5 local-time rules:
+ * - If the timestamp has an explicit timezone (`Z` or `utcOffset`), formats in the
+ *   viewer's local clock (or explicit offset).
+ * - If `utcOffset` is omitted, preserves the carrier's local wall-clock reading
+ *   as-is and labels it `(local)` so it is never mistakenly shifted as UTC.
+ */
+export function formatTrackingEventDate(datetime: string, utcOffset?: string): string {
+  const trimmed = datetime.trim()
+  if (!trimmed) return 'Pending'
+
+  if (ISO_WITH_TZ_RE.test(trimmed)) {
+    const parsed = new Date(trimmed)
+    if (Number.isNaN(parsed.getTime())) return trimmed
+    return parsed.toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    })
+  }
+
+  if (utcOffset && UTC_OFFSET_RE.test(utcOffset.trim())) {
+    const parsed = new Date(`${trimmed}${utcOffset.trim()}`)
+    if (Number.isNaN(parsed.getTime())) return `${trimmed} (${utcOffset})`
+    return parsed.toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    })
+  }
+
+  // Unknown offset: format wall-clock components verbatim without timezone conversion
+  const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/)
+  if (!match) return trimmed
+  const [, yearStr, monthStr, dayStr, hourStr, minStr] = match
+  const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const monthLabel = monthNames[Math.max(0, Number(monthStr) - 1)] ?? monthStr
+  const hour24 = Number(hourStr)
+  const period = hour24 >= 12 ? 'PM' : 'AM'
+  const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12
+  return `${monthLabel} ${Number(dayStr)}, ${hour12}:${minStr} ${period} (local)`
 }

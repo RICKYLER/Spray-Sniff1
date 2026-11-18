@@ -112,6 +112,7 @@ interface StoreContextType extends StoreState {
     input: {
       status: OrderStatus
       courier?: string
+      courierSlug?: string
       trackingNumber?: string
       deliveryNotes?: string
       note?: string

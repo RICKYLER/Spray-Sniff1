@@ -204,8 +204,10 @@ type StoreOrderRow = {
   shipping_address: string | null
   notes: string | null
   courier: string | null
+  courier_slug?: string | null
   tracking_number: string | null
   delivery_notes: string | null
+  parcels_last_synced_at?: string | null
 }
 
 type StoreOrderItemRow = {
@@ -297,10 +299,25 @@ function cachePublicStoreSnapshot(state: StoreState) {
   publicStoreSnapshotCacheExpiresAt = Date.now() + PUBLIC_SNAPSHOT_CACHE_TTL_MS
 }
 
-function clearBackofficeStoreSnapshotCache() {
+export function clearBackofficeStoreSnapshotCache() {
   backofficeStoreSnapshotCache = null
   backofficeStoreSnapshotCacheExpiresAt = 0
 }
+
+function isMissingOrderDeliveryColumnsError(error: { code?: string; message?: string } | null | undefined) {
+  if (!error) return false
+  const msg = (error.message || '').toLowerCase()
+  return (
+    error.code === '42703' ||
+    error.code === 'PGRST204' ||
+    msg.includes('courier_slug') ||
+    msg.includes('parcels_last_synced_at')
+  )
+}
+
+const BASE_STORE_ORDER_SELECT =
+  'id, source, customer_id, customer_name, customer_email, status, payment_method, payment_status, created_at, subtotal, tax, shipping, total, shipping_address, notes, courier, tracking_number, delivery_notes'
+const EXTENDED_STORE_ORDER_SELECT = `${BASE_STORE_ORDER_SELECT}, courier_slug, parcels_last_synced_at`
 
 function clearPublicStoreSnapshotCache() {
   publicStoreSnapshotCache = null
@@ -532,7 +549,7 @@ async function loadBackofficeStoreState() {
   const [
     { data: catalogRows, error: catalogError },
     { data: inventoryRows, error: inventoryError },
-    { data: orderRows, error: ordersError },
+    initialOrdersRes,
     { data: orderItemRows, error: orderItemsError },
     { data: orderTimelineRows, error: timelineError },
     { data: posRows, error: posError },
@@ -544,9 +561,7 @@ async function loadBackofficeStoreState() {
     supabase.from('inventory_items').select(
       'product_id, sku, stock, reorder_point, location, last_updated, last_updated_by, is_archived, archived_at, archived_by',
     ),
-    supabase.from('store_orders').select(
-      'id, source, customer_id, customer_name, customer_email, status, payment_method, payment_status, created_at, subtotal, tax, shipping, total, shipping_address, notes, courier, tracking_number, delivery_notes',
-    ),
+    supabase.from('store_orders').select(EXTENDED_STORE_ORDER_SELECT),
     supabase.from('store_order_items').select(
       'order_id, product_id, product_name, size_ml, quantity, unit_price',
     ),
@@ -560,6 +575,14 @@ async function loadBackofficeStoreState() {
       'id, product_id, product_name, change_quantity, reason, actor, created_at, resulting_stock, note',
     ),
   ])
+
+  let orderRows = initialOrdersRes.data
+  let ordersError = initialOrdersRes.error
+  if (ordersError && isMissingOrderDeliveryColumnsError(ordersError)) {
+    const fallbackRes = await supabase.from('store_orders').select(BASE_STORE_ORDER_SELECT)
+    orderRows = fallbackRes.data as typeof orderRows
+    ordersError = fallbackRes.error
+  }
 
   if (catalogError) throw catalogError
   if (inventoryError) throw inventoryError
@@ -627,8 +650,10 @@ async function loadBackofficeStoreState() {
       shippingAddress: row.shipping_address ?? undefined,
       notes: row.notes ?? undefined,
       courier: row.courier ?? undefined,
+      courierSlug: row.courier_slug ?? undefined,
       trackingNumber: row.tracking_number ?? undefined,
       deliveryNotes: row.delivery_notes ?? undefined,
+      parcelsLastSyncedAt: row.parcels_last_synced_at ?? undefined,
       items: (orderItemsByOrderId.get(row.id) ?? []).sort((left, right) =>
         left.productName.localeCompare(right.productName),
       ),
@@ -704,8 +729,8 @@ function mapInventoryRow(record: InventoryRecord) {
   }
 }
 
-function mapStoreOrderRow(order: OrderRecord) {
-  return {
+function mapStoreOrderRow(order: OrderRecord, includeExtendedDeliveryCols = true) {
+  const baseRow = {
     id: order.id,
     source: order.source,
     customer_id: order.customerId ?? null,
@@ -725,6 +750,16 @@ function mapStoreOrderRow(order: OrderRecord) {
     courier: order.courier ?? null,
     tracking_number: order.trackingNumber ?? null,
     delivery_notes: order.deliveryNotes ?? null,
+  }
+
+  if (!includeExtendedDeliveryCols) {
+    return baseRow
+  }
+
+  return {
+    ...baseRow,
+    courier_slug: order.courierSlug ?? null,
+    parcels_last_synced_at: order.parcelsLastSyncedAt ?? null,
   }
 }
 
@@ -1054,7 +1089,15 @@ async function syncNormalizedStoreTables(state: StoreState) {
   }
 
   if (state.orders.length > 0) {
-    await upsertRows('store_orders', state.orders.map(mapStoreOrderRow), 'id')
+    try {
+      await upsertRows('store_orders', state.orders.map((order) => mapStoreOrderRow(order, true)), 'id')
+    } catch (error) {
+      if (isMissingOrderDeliveryColumnsError(error as { code?: string; message?: string })) {
+        await upsertRows('store_orders', state.orders.map((order) => mapStoreOrderRow(order, false)), 'id')
+      } else {
+        throw error
+      }
+    }
 
     const orderItemRows = mapStoreOrderItemRows(state.orders)
     const timelineRows = mapOrderTimelineRows(state.orders)
@@ -1137,7 +1180,15 @@ async function deleteCatalogAndInventory(productId: string) {
 }
 
 async function persistSingleOrder(order: OrderRecord) {
-  await upsertRow('store_orders', mapStoreOrderRow(order), 'id')
+  try {
+    await upsertRow('store_orders', mapStoreOrderRow(order, true), 'id')
+  } catch (error) {
+    if (isMissingOrderDeliveryColumnsError(error as { code?: string; message?: string })) {
+      await upsertRow('store_orders', mapStoreOrderRow(order, false), 'id')
+    } else {
+      throw error
+    }
+  }
   const itemRows = mapStoreOrderItemRows([order])
   if (itemRows.length > 0) {
     await upsertRows('store_order_items', itemRows, 'id')
@@ -1761,18 +1812,27 @@ async function loadOrdersForCustomer(actor: StoreActor) {
     conditions.push(`customer_email.ilike.${email}`)
   }
 
-  let query = supabase
-    .from('store_orders')
-    .select(
-      'id, source, customer_id, customer_name, customer_email, status, payment_method, payment_status, created_at, subtotal, tax, shipping, total, shipping_address, notes, courier, tracking_number, delivery_notes',
-    )
-    .eq('source', 'ONLINE')
+  const buildCustomerOrderQuery = (selectCols: string) => {
+    let q = supabase
+      .from('store_orders')
+      .select(selectCols)
+      .eq('source', 'ONLINE')
 
-  if (conditions.length > 0) {
-    query = query.or(conditions.join(','))
+    if (conditions.length > 0) {
+      q = q.or(conditions.join(','))
+    }
+
+    return q.order('created_at', { ascending: false })
   }
 
-  const { data: orderRows, error: ordersError } = await query.order('created_at', { ascending: false })
+  const initialCustomerRes = await buildCustomerOrderQuery(EXTENDED_STORE_ORDER_SELECT)
+  let orderRows = initialCustomerRes.data as StoreOrderRow[] | null
+  let ordersError = initialCustomerRes.error
+  if (ordersError && isMissingOrderDeliveryColumnsError(ordersError)) {
+    const fallbackRes = await buildCustomerOrderQuery(BASE_STORE_ORDER_SELECT)
+    orderRows = fallbackRes.data as StoreOrderRow[] | null
+    ordersError = fallbackRes.error
+  }
 
   if (ordersError) throw ordersError
 
@@ -1851,8 +1911,10 @@ async function loadOrdersForCustomer(actor: StoreActor) {
           shippingAddress: row.shipping_address ?? undefined,
           notes: row.notes ?? undefined,
           courier: row.courier ?? undefined,
+          courierSlug: row.courier_slug ?? undefined,
           trackingNumber: row.tracking_number ?? undefined,
           deliveryNotes: row.delivery_notes ?? undefined,
+          parcelsLastSyncedAt: row.parcels_last_synced_at ?? undefined,
           items: (orderItemsByOrderId.get(row.id) ?? []).sort((left, right) =>
             left.productName.localeCompare(right.productName),
           ),
