@@ -185,10 +185,14 @@ export interface OrderRecord {
   notes?: string
   /** Courier or logistics partner handling the delivery, entered by an admin. */
   courier?: string
+  /** Canonical Parcels API v5 carrier slug accepted by `carrier_hint`. */
+  courierSlug?: string
   /** The courier's own tracking number for this parcel, entered by an admin. */
   trackingNumber?: string
   /** Free-text delivery instructions recorded by an admin. */
   deliveryNotes?: string
+  /** Timestamp of the most recent live courier sync via Parcels v5. */
+  parcelsLastSyncedAt?: string
   items: OrderLineItem[]
   timeline: OrderTimelineEntry[]
   paymentSummary?: OrderPaymentSummary
@@ -334,6 +338,7 @@ export type StoreAction =
     orderId: string
     status: OrderStatus
     courier?: string
+    courierSlug?: string
     trackingNumber?: string
     deliveryNotes?: string
     note?: string
@@ -1794,6 +1799,10 @@ export function performStoreAction(
       // A key that is present but blank clears the stored value; a key that was
       // never sent leaves the existing value alone.
       const courier = 'courier' in action ? sanitizeDeliveryField(action.courier) : existingOrder.courier
+      const courierSlug =
+        'courierSlug' in action
+          ? sanitizeDeliveryField(action.courierSlug)
+          : existingOrder.courierSlug
       const trackingNumber =
         'trackingNumber' in action
           ? sanitizeDeliveryField(action.trackingNumber)
@@ -1807,6 +1816,7 @@ export function performStoreAction(
         ...existingOrder,
         status: action.status,
         courier,
+        courierSlug,
         trackingNumber,
         deliveryNotes,
         timeline: [

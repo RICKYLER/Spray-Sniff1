@@ -1,24 +1,28 @@
 import crypto from 'crypto'
 import {
+  ParcelsApiError,
   verifyParcelsWebhookSignature,
   mapParcelsToTrackingResult,
   trackShipmentSync,
+  searchTrackingCarriers,
   getParcelsConfig,
   type ParcelsTrackingResultItem,
 } from '../lib/parcels-api'
+import { formatTrackingEventDate } from '../lib/tracking-types'
 
 async function runTests() {
-  console.log('🧪 [Test Suite] ParcelsApp Integration Verification\n')
+  console.log('🧪 [Test Suite] ParcelsApp API v5 Integration Verification\n')
 
   // Test 1: Config
   const config = getParcelsConfig()
   console.log('1. Configuration Test:')
+  console.log(`   Version: ${config.version}`)
   console.log(`   Base URL: ${config.baseUrl}`)
-  console.log(`   Is Mock Sandbox: ${config.isMock}`)
-  if (config.baseUrl.includes('mock') || config.baseUrl.includes('parcelsapp.com')) {
-    console.log('   ✅ Config initialized correctly.')
+  console.log(`   Is Live: ${config.isLive}`)
+  if (config.baseUrl.includes('/v5')) {
+    console.log('   ✅ v5 Config initialized correctly.')
   } else {
-    throw new Error('Config failed')
+    throw new Error('Config is not pointing to v5')
   }
 
   // Test 2: Webhook HMAC-SHA256 Signature Verification
@@ -76,12 +80,15 @@ async function runTests() {
         {
           state: 'Delivered, In/At Mailbox',
           location: 'Cebu City',
-          date: '2026-11-09T08:00:00.000Z',
+          date: '2026-11-09T16:00:00',
+          utcOffset: '+08:00',
+          event_code: 'DLV',
+          station: 'CEB',
         },
         {
           state: 'Out for Delivery',
           location: 'Cebu City Hub',
-          date: '2026-11-09T06:00:00.000Z',
+          date: '2026-11-09T09:30:00',
         },
       ],
       detectedCarrier: {
@@ -113,15 +120,36 @@ async function runTests() {
     mapped.status === 'delivered' &&
     mapped.isLiveCourier &&
     mapped.events.length === 2 &&
-    mapped.carrier.name === 'J&T Express Philippines'
+    mapped.carrier.name === 'J&T Express Philippines' &&
+    mapped.events[0].utcOffset === '+08:00' &&
+    formatTrackingEventDate('2026-11-09T09:30:00').includes('(local)')
   ) {
-    console.log('   ✅ Data mapping passed cleanly.')
+    console.log('   ✅ v5 Data mapping and timestamp handling passed cleanly.')
   } else {
-    throw new Error('Mapping output did not match expectations!')
+    throw new Error('Mapping output did not match v5 expectations!')
   }
 
-  // Test 4: Live Mock Sandbox Request
-  console.log('\n4. ParcelsApp Live Sandbox Request Test:')
+  // Test 4: Live v5 Tracking Carriers Catalog
+  console.log('\n4. ParcelsApp v5 Tracking Carriers Catalog Test:')
+  try {
+    const catalog = await searchTrackingCarriers({ query: 'lbc', limit: 5 })
+    console.log(`   Matched carriers for "lbc": ${catalog.carriers.length} (total: ${catalog.total_matches})`)
+    if (catalog.carriers.length === 0) {
+      throw new Error('Expected at least one carrier match for "lbc"')
+    }
+    console.log(`   Sample slug: ${catalog.carriers[0].slug} (${catalog.carriers[0].name})`)
+    console.log('   ✅ GET /tracking-carriers succeeded!')
+  } catch (err) {
+    if (err instanceof ParcelsApiError && err.code === 'UNCONFIRMED_ACCOUNT') {
+      console.warn('   ⚠️ Live account email confirmation pending (UNCONFIRMED_ACCOUNT).')
+      console.warn('      Confirm via:', err.details?.confirmation_url)
+    } else {
+      throw err
+    }
+  }
+
+  // Test 5: Live v5 Tracking Request Test
+  console.log('\n5. ParcelsApp v5 Live Request Test:')
   try {
     const { response, shipmentResult } = await trackShipmentSync({
       trackingNumber: '9400111206213785678901',
@@ -131,18 +159,23 @@ async function runTests() {
 
     console.log(`   Response Request ID: ${response.request_id}`)
     console.log(`   Response Status: ${response.status} (Done: ${response.done})`)
+    console.log(`   Expires At: ${response.expires_at}`)
     console.log(`   Shipment State: ${shipmentResult?.state}`)
     console.log(`   Carrier: ${shipmentResult?.shipment?.detectedCarrier?.name || 'USPS'}`)
     console.log(`   Checkpoints returned: ${shipmentResult?.shipment?.states?.length ?? 0}`)
 
-    if (response.request_id && shipmentResult) {
-      console.log('   ✅ Sandbox query succeeded!')
+    if (response.request_id && response.expires_at) {
+      console.log('   ✅ v5 query succeeded!')
     } else {
-      console.log('   ⚠️ Sandbox response empty or unexpected.')
+      throw new Error('v5 response missing request_id or expires_at')
     }
   } catch (err) {
-    console.error('   ❌ Sandbox query error:', err)
-    throw err
+    if (err instanceof ParcelsApiError && err.code === 'UNCONFIRMED_ACCOUNT') {
+      console.warn('   ⚠️ Live tracking skipped until ParcelsApp account email is confirmed (UNCONFIRMED_ACCOUNT).')
+    } else {
+      console.error('   ❌ v5 query error:', err)
+      throw err
+    }
   }
 
   console.log('\n🎉 ALL PARCELSAPP INTEGRATION TESTS PASSED!')

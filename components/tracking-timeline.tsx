@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import {
   DELIVERY_STAGES,
+  formatTrackingEventDate,
   getDeliveryStageIndex,
   type TrackingResult,
 } from '@/lib/tracking-types'
@@ -79,7 +80,12 @@ export function TrackingTimeline({ tracking }: TrackingTimelineProps) {
               {tracking.isLiveCourier && (
                 <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
                   <Radio className="h-3 w-3 text-emerald-600 animate-pulse" />
-                  Live Satellite Scan
+                  Live Courier Telemetry
+                </span>
+              )}
+              {tracking.isProcessing && (
+                <span className="inline-flex items-center gap-1 rounded-md bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800 dark:bg-amber-950/50 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                  Syncing Carrier...
                 </span>
               )}
             </div>
@@ -120,6 +126,15 @@ export function TrackingTimeline({ tracking }: TrackingTimelineProps) {
             <p className="text-xs text-muted-foreground mt-1.5">
               Status: <span className="font-medium text-foreground">{tracking.estimatedDelivery}</span>
             </p>
+            {tracking.deliveryEstimate && (
+              <p className="text-[11px] text-muted-foreground mt-0.5">
+                Forecast: ~{Math.round(tracking.deliveryEstimate.medianDays)} day(s) typical transit
+                {tracking.deliveryEstimate.typicalDays?.min !== undefined &&
+                  tracking.deliveryEstimate.typicalDays?.max !== undefined && (
+                    <> ({Math.round(tracking.deliveryEstimate.typicalDays.min)}–{Math.round(tracking.deliveryEstimate.typicalDays.max)}d range)</>
+                  )}
+              </p>
+            )}
           </div>
         </div>
 
@@ -173,6 +188,16 @@ export function TrackingTimeline({ tracking }: TrackingTimelineProps) {
             </div>
           </div>
         </div>
+
+        {tracking.shipmentError === 'ADDITIONAL_FIELDS_REQUIRED' && (
+          <div className="mt-6 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <p>
+              This carrier requires additional recipient verification (
+              {tracking.acceptedFields?.join(', ') || 'postal code / contact'}). Please verify via the carrier&apos;s official link above or contact our support team.
+            </p>
+          </div>
+        )}
 
         {isException && (
           <div className="mt-6 flex items-start gap-3 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-200">
@@ -249,19 +274,23 @@ export function TrackingTimeline({ tracking }: TrackingTimelineProps) {
 
                     <time className="text-xs text-muted-foreground flex items-center gap-1 font-mono">
                       <Calendar className="w-3 h-3" />
-                      {new Date(event.datetime).toLocaleString('en-US', {
-                        month: 'short',
-                        day: 'numeric',
-                        hour: 'numeric',
-                        minute: '2-digit',
-                        hour12: true,
-                      })}
+                      {formatTrackingEventDate(event.datetime, event.utcOffset)}
                     </time>
                   </div>
 
-                  <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
+                  <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1.5 flex-wrap">
                     <MapPin className="w-3 h-3 text-muted-foreground/70 shrink-0" />
                     <span>{event.location}</span>
+                    {event.station && (
+                      <span className="rounded border border-border px-1 py-0.2 font-mono text-[10px]">
+                        {event.station}
+                      </span>
+                    )}
+                    {event.eventCode && (
+                      <span className="rounded border border-border px-1 py-0.2 font-mono text-[10px]">
+                        {event.eventCode}
+                      </span>
+                    )}
                   </p>
 
                   {event.description && event.description !== event.status && (

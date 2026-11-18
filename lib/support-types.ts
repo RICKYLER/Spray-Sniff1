@@ -119,6 +119,7 @@ export type SupportActionRequest =
       category?: SupportCategory
       orderId?: string
       message?: string
+      history?: SupportChatTurn[]
     }
 
 export interface SupportActionResult {
@@ -128,5 +129,26 @@ export interface SupportActionResult {
   order?: OrderRecord
   case?: SupportCase
   cases?: SupportCase[]
+}
+
+export interface SupportChatTurn {
+  role: 'user' | 'assistant'
+  content: string
+  createdAt?: string
+}
+
+export interface SupportChatRequest {
+  message: string
+  history?: SupportChatTurn[]
+  orderId?: string
+}
+
+export interface SupportChatResponse {
+  reply: string
+  escalated: boolean
+  case?: SupportCase
+  provider: 'agentrouter' | 'ollama' | 'concierge-fallback'
+  model?: string
+  suggestedActions?: SupportQuickActionId[]
 }
 

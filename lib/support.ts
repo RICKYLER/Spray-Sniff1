@@ -3,6 +3,7 @@ import '@/lib/server-only'
 import { randomUUID } from 'crypto'
 import {
   getVisibleStoreState,
+  loadPublicStoreSnapshot,
   loadStoreSnapshot,
   loadStoreStateForActor,
   saveStoreSnapshot,
@@ -21,8 +22,9 @@ import {
   buildOrdersOverviewMessage,
   buildPaymentDetailMessage,
   buildSupportWelcomeMessage,
-  generateConciergeChatReply,
   isHumanEscalationRequest,
+  runConciergeChatTurn,
+  type ConciergeProductContext,
 } from '@/lib/support-ai'
 import type {
   SupportActionRequest,
@@ -31,6 +33,9 @@ import type {
   SupportBootstrapPayload,
   SupportCase,
   SupportCategory,
+  SupportChatRequest,
+  SupportChatResponse,
+  SupportChatTurn,
   SupportFaq,
   SupportMessage,
   SupportPaymentSnapshot,
@@ -803,12 +808,14 @@ export async function runSupportAction(
           ? normalizeText(request.message)
           : 'Customer requested live human admin assistance from support desk.'
 
-      const supportCase = await createSupportCaseRecord(actor, {
+      const supportCase = await escalateConversationToAdmin(actor, {
         category,
         order,
-        message,
-        priority: 'high',
-        status: 'waiting_on_staff',
+        history: request.history,
+        latestMessage: message,
+        reason: 'Customer explicitly connected to Live Admin',
+        botReply:
+          'I am connecting you with our Live Admin Team and sharing our conversation history so you do not have to repeat yourself.',
       })
 
       return {
@@ -817,6 +824,221 @@ export async function runSupportAction(
         case: supportCase,
       }
     }
+  }
+}
+
+async function loadConciergeProductContext(): Promise<ConciergeProductContext[]> {
+  try {
+    const publicSnapshot = await loadPublicStoreSnapshot()
+    return publicSnapshot.catalog
+      .filter((product) => product.inStock !== false)
+      .slice(0, 20)
+      .map((product) => ({
+        id: product.id,
+        name: product.name,
+        category: product.category,
+        price: product.price,
+        notes: [...product.topNotes, ...product.middleNotes, ...product.baseNotes].slice(0, 6),
+        description: product.description,
+        featured: product.featured,
+      }))
+  } catch {
+    return []
+  }
+}
+
+async function escalateConversationToAdmin(
+  actor: StoreActor,
+  input: {
+    category: SupportCategory
+    order?: OrderRecord
+    history?: SupportChatTurn[]
+    latestMessage: string
+    reason?: string
+    botReply?: string
+  },
+): Promise<SupportCase> {
+  const supabase = createSupabaseAdminClient()
+  const baseMs = Date.now()
+  const supportCaseId = createSupportCaseId()
+  const initialCustomerMessage = normalizeText(input.latestMessage)
+  const sanitizedHistory = (input.history ?? [])
+    .filter((turn) => turn.content && turn.content.trim().length > 0)
+    .slice(-12)
+
+  const paymentRecordId = input.order?.id ? `${input.order.id}::payment` : null
+  const paymentReference = input.order?.paymentSummary?.reference ?? null
+  const summarySource = input.reason
+    ? `${input.reason}. Latest customer message: ${initialCustomerMessage}`
+    : initialCustomerMessage
+  const latestSummary = await buildCaseHandoffSummary({
+    category: input.category,
+    order: input.order,
+    requestMessage: summarySource,
+    supportCase: {
+      id: supportCaseId,
+      status: 'waiting_on_staff',
+      priority: 'high',
+    },
+  })
+
+  const createdAt = new Date(baseMs).toISOString()
+  const caseRow = {
+    id: supportCaseId,
+    customer_id: actor.id,
+    customer_email: actor.email,
+    category: input.category,
+    status: 'waiting_on_staff' as const,
+    priority: 'high' as const,
+    source: 'chatbot' as const,
+    order_id: input.order?.id ?? null,
+    payment_record_id: paymentRecordId,
+    payment_reference: paymentReference,
+    latest_summary: `[HANDED OVER TO LIVE ADMIN] ${latestSummary}`,
+    assigned_to: null,
+    created_at: createdAt,
+    updated_at: createdAt,
+  }
+
+  const { error: insertCaseError } = await supabase.from('support_cases').insert(caseRow)
+  if (insertCaseError) {
+    throw insertCaseError
+  }
+
+  const messageRows: Array<{
+    id: string
+    case_id: string
+    author_type: SupportAuthorType
+    author_id: string | null
+    message: string
+    metadata: Record<string, unknown> | null
+    created_at: string
+  }> = []
+
+  let offsetMs = 1
+  for (const turn of sanitizedHistory) {
+    messageRows.push({
+      id: createSupportMessageId(),
+      case_id: supportCaseId,
+      author_type: turn.role === 'user' ? 'customer' : 'bot',
+      author_id: turn.role === 'user' ? actor.id : null,
+      message: normalizeText(turn.content),
+      metadata: { fromPreEscalationChat: true },
+      created_at: new Date(baseMs + offsetMs++).toISOString(),
+    })
+  }
+
+  const lastHistoryTurn = sanitizedHistory[sanitizedHistory.length - 1]
+  if (
+    !lastHistoryTurn ||
+    lastHistoryTurn.role !== 'user' ||
+    normalizeText(lastHistoryTurn.content) !== initialCustomerMessage
+  ) {
+    messageRows.push({
+      id: createSupportMessageId(),
+      case_id: supportCaseId,
+      author_type: 'customer',
+      author_id: actor.id,
+      message: initialCustomerMessage,
+      metadata: input.order
+        ? {
+            orderId: input.order.id,
+            paymentReference: input.order.paymentSummary?.reference ?? null,
+          }
+        : null,
+      created_at: new Date(baseMs + offsetMs++).toISOString(),
+    })
+  }
+
+  const handoffReply =
+    input.botReply?.trim() ||
+    `I have handed this conversation over to our Live Admin Team so they can resolve your concern directly. Ticket Ref: ${supportCaseId}.`
+
+  messageRows.push({
+    id: createSupportMessageId(),
+    case_id: supportCaseId,
+    author_type: 'bot',
+    author_id: null,
+    message: `${handoffReply}\n\nTicket Ref: ${supportCaseId} (Priority: High · Waiting on Admin)`,
+    metadata: { escalated: true, reason: input.reason ?? null },
+    created_at: new Date(baseMs + offsetMs).toISOString(),
+  })
+
+  const { error: insertMessagesError } = await supabase.from('support_messages').insert(messageRows)
+  if (insertMessagesError) {
+    throw insertMessagesError
+  }
+
+  const createdCase = await getSupportCaseDetail(actor, supportCaseId)
+  if (!createdCase) {
+    throw new Error('Support case created, but the detail could not be loaded.')
+  }
+
+  return createdCase
+}
+
+export async function handleConciergeChatTurn(
+  actor: StoreActor | null,
+  request: SupportChatRequest,
+): Promise<SupportChatResponse> {
+  if (!isCustomerActor(actor)) {
+    throw new Error('Sign in with your customer account to chat with the concierge.')
+  }
+
+  const trimmedMessage = normalizeText(request.message ?? '')
+  if (!trimmedMessage) {
+    throw new Error('Enter a message before sending it.')
+  }
+
+  const [products, orders] = await Promise.all([
+    loadConciergeProductContext(),
+    loadVisibleOrdersForActor(actor),
+  ])
+
+  const selectedOrder = request.orderId
+    ? orders.find((order) => order.id === request.orderId)
+    : undefined
+
+  const turnResult = await runConciergeChatTurn({
+    userMessage: trimmedMessage,
+    customerName: actor.name,
+    history: request.history,
+    products,
+    orders: orders.map((order) => ({
+      id: order.id,
+      status: order.status,
+      paymentStatus: order.paymentStatus,
+      total: order.total,
+      courier: order.courier ?? null,
+      trackingNumber: order.trackingNumber ?? null,
+    })),
+    selectedOrderId: selectedOrder?.id,
+  })
+
+  if (turnResult.escalate) {
+    const supportCase = await escalateConversationToAdmin(actor, {
+      category: turnResult.category,
+      order: selectedOrder,
+      history: request.history,
+      latestMessage: trimmedMessage,
+      reason: turnResult.reason,
+      botReply: turnResult.reply,
+    })
+
+    return {
+      reply: `${turnResult.reply}\n\nTicket Ref: ${supportCase.id} (Handed over to Live Admin)`,
+      escalated: true,
+      case: supportCase,
+      provider: turnResult.provider,
+      model: turnResult.model,
+    }
+  }
+
+  return {
+    reply: turnResult.reply,
+    escalated: false,
+    provider: turnResult.provider,
+    model: turnResult.model,
   }
 }
 
@@ -887,26 +1109,53 @@ export async function addSupportCaseMessage(
         metadata: { escalated: true },
         created_at: new Date().toISOString(),
       })
-    } else {
+    } else if (!caseRow.assigned_to) {
       try {
-        const aiReply = await generateConciergeChatReply({
+        const [products, orders] = await Promise.all([
+          loadConciergeProductContext(),
+          loadVisibleOrdersForActor(actor),
+        ])
+
+        const turnResult = await runConciergeChatTurn({
           userMessage: trimmedMessage,
           customerName: actor.name,
-          category: caseRow.category,
-          orderContext: caseRow.order_id ? { id: caseRow.order_id, status: caseRow.status } : null,
+          products,
+          orders: orders.map((order) => ({
+            id: order.id,
+            status: order.status,
+            paymentStatus: order.paymentStatus,
+            total: order.total,
+            courier: order.courier ?? null,
+            trackingNumber: order.trackingNumber ?? null,
+          })),
+          selectedOrderId: caseRow.order_id ?? undefined,
         })
 
-        if (aiReply) {
-          await supabase.from('support_messages').insert({
-            id: createSupportMessageId(),
-            case_id: caseId,
-            author_type: 'bot',
-            author_id: null,
-            message: aiReply,
-            metadata: { provider: 'ollama' },
-            created_at: new Date().toISOString(),
-          })
+        if (turnResult.escalate) {
+          await supabase
+            .from('support_cases')
+            .update({
+              status: 'waiting_on_staff',
+              priority: 'high',
+              latest_summary: `[ESCALATED TO LIVE ADMIN] ${turnResult.reason ?? trimmedMessage}`,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', caseId)
         }
+
+        await supabase.from('support_messages').insert({
+          id: createSupportMessageId(),
+          case_id: caseId,
+          author_type: 'bot',
+          author_id: null,
+          message: turnResult.reply,
+          metadata: {
+            provider: turnResult.provider,
+            model: turnResult.model ?? null,
+            escalated: turnResult.escalate,
+          },
+          created_at: new Date().toISOString(),
+        })
       } catch {
         // Continue without interrupting customer thread if AI call fails
       }

@@ -6,23 +6,247 @@ import {
   DELIVERY_STATUS_RANK,
   TRACKABLE_EVENT_STATUSES,
   mapOrderStatusToDeliveryStage,
+  toComparableTimestampMs,
   type TrackingEvent,
   type TrackingResult,
 } from '@/lib/tracking-types'
 import {
+  ParcelsApiError,
   mapParcelsToTrackingResult,
+  pollParcelsTrackingSession,
   trackShipmentSync,
 } from '@/lib/parcels-api'
+import {
+  getParcelsTrackingRequestMetadata,
+  saveParcelsTrackingRequest,
+  syncOrderWithParcelsShipment,
+} from '@/lib/tracking-sync'
 
 const NOT_FOUND_MESSAGE =
   'No order or shipment found for that tracking number. Please check your Order ID (e.g. WEB-XXXXXXXX-XXXX) or waybill tracking number.'
 
+interface TrackableOrderRow {
+  id: string
+  status: string
+  created_at: string
+  courier: string | null
+  courier_slug?: string | null
+  tracking_number: string | null
+  delivery_notes: string | null
+  notes: string | null
+}
+
+function isMissingCourierSlugError(error: { code?: string; message?: string } | null | undefined) {
+  if (!error) return false
+  const msg = (error.message || '').toLowerCase()
+  return error.code === '42703' || error.code === 'PGRST204' || msg.includes('courier_slug')
+}
+
+async function findStoreOrderForTracking(cleanKey: string): Promise<TrackableOrderRow | null> {
+  const supabase = createSupabaseAdminClient()
+  const safeKey = cleanKey.replace(/[,()]/g, '').trim()
+  if (!safeKey) return null
+
+  const extendedCols = 'id, status, created_at, courier, courier_slug, tracking_number, delivery_notes, notes'
+  const baseCols = 'id, status, created_at, courier, tracking_number, delivery_notes, notes'
+
+  const runExactQuery = async (cols: string) =>
+    supabase
+      .from('store_orders')
+      .select(cols)
+      .or(`id.ilike.${safeKey},tracking_number.ilike.${safeKey}`)
+      .limit(1)
+
+  let res = await runExactQuery(extendedCols)
+  if (res.error && isMissingCourierSlugError(res.error)) {
+    res = await runExactQuery(baseCols)
+  }
+
+  if (res.data && res.data.length > 0) {
+    return res.data[0] as unknown as TrackableOrderRow
+  }
+
+  // Fallback: match reference in notes
+  const runNotesQuery = async (cols: string) =>
+    supabase
+      .from('store_orders')
+      .select(cols)
+      .ilike('notes', `%${safeKey}%`)
+      .limit(1)
+
+  let notesRes = await runNotesQuery(extendedCols)
+  if (notesRes.error && isMissingCourierSlugError(notesRes.error)) {
+    notesRes = await runNotesQuery(baseCols)
+  }
+
+  if (notesRes.data && notesRes.data.length > 0) {
+    return notesRes.data[0] as unknown as TrackableOrderRow
+  }
+
+  return null
+}
+
+async function loadInternalTimelineEvents(orderId: string): Promise<TrackingEvent[]> {
+  const supabase = createSupabaseAdminClient()
+  const { data: timelineEntries, error: timelineError } = await supabase
+    .from('order_timeline_entries')
+    .select('status, created_at, note, actor_name, previous_status')
+    .eq('order_id', orderId)
+    .order('created_at', { ascending: false })
+
+  if (timelineError) {
+    console.error('Error querying timeline for tracking:', timelineError)
+  }
+
+  const rawEvents: TrackingEvent[] = (timelineEntries ?? []).map((entry, index) => ({
+    id: `${orderId}-ev-${index}`,
+    datetime: entry.created_at,
+    status: entry.status,
+    stage: mapOrderStatusToDeliveryStage(entry.status),
+    location: entry.actor_name ? `${SITE_NAME} — ${entry.actor_name}` : `${SITE_NAME} store team`,
+    description: entry.note,
+    source: entry.actor_name?.includes('(Auto-sync)') ? 'courier' : 'store',
+    recordedBy: entry.actor_name ?? undefined,
+    previousStatus: entry.previous_status ?? undefined,
+  }))
+
+  const filteredEvents = rawEvents.filter((entry) => TRACKABLE_EVENT_STATUSES.has(entry.status))
+  const events = filteredEvents.length > 0 ? filteredEvents : rawEvents
+
+  return events.sort(
+    (a, b) =>
+      toComparableTimestampMs(b.datetime, b.utcOffset) -
+      toComparableTimestampMs(a.datetime, a.utcOffset),
+  )
+}
+
+function buildBaselineOrderResult(
+  order: TrackableOrderRow,
+  internalEvents: TrackingEvent[],
+): TrackingResult {
+  const storeStage = mapOrderStatusToDeliveryStage(order.status)
+  const deliveredStage = DELIVERY_STAGES[DELIVERY_STAGES.length - 1]
+
+  return {
+    trackingNumber: order.tracking_number || order.id,
+    orderId: order.id,
+    carrier: {
+      code: order.courier_slug || 'store',
+      slug: order.courier_slug || undefined,
+      name: order.courier || `${SITE_NAME} delivery team`,
+    },
+    status: storeStage,
+    statusText: order.status,
+    estimatedDelivery:
+      storeStage === deliveredStage.stage ? 'Delivered' : 'Updated by our store team',
+    lastUpdated: internalEvents[0]?.datetime ?? order.created_at,
+    events: internalEvents,
+  }
+}
+
+function mergeOrderWithParcels(
+  order: TrackableOrderRow,
+  internalEvents: TrackingEvent[],
+  merged: TrackingResult,
+): TrackingResult {
+  const storeStage = mapOrderStatusToDeliveryStage(order.status)
+  const storeRank = DELIVERY_STATUS_RANK[order.status] ?? 0
+  const courierRank = DELIVERY_STATUS_RANK[merged.statusText] ?? 0
+
+  return {
+    ...merged,
+    status: courierRank >= storeRank ? merged.status : storeStage,
+    statusText: courierRank >= storeRank ? merged.statusText : order.status,
+    orderId: order.id,
+    events: merged.events.length > 0 ? merged.events : internalEvents,
+  }
+}
+
 export async function GET(request: NextRequest) {
   try {
+    const requestId = request.nextUrl.searchParams.get('requestId')?.trim()
+    const carrierHintParam = request.nextUrl.searchParams.get('carrier')?.trim() || undefined
     const trackingNumber =
       request.nextUrl.searchParams.get('number')?.trim() ||
       request.nextUrl.searchParams.get('num')?.trim() ||
       request.nextUrl.searchParams.get('orderId')?.trim()
+
+    // ── Poll Existing Asynchronous Parcels v5 Request ────────────────────────
+    if (requestId) {
+      const metadata = await getParcelsTrackingRequestMetadata(requestId)
+      const polled = await pollParcelsTrackingSession(requestId)
+
+      if (!polled) {
+        return NextResponse.json(
+          { error: 'Tracking session expired. Refresh to start a new lookup.', expired: true },
+          { status: 404 },
+        )
+      }
+
+      const item =
+        (metadata?.tracking_number
+          ? polled.results?.find(
+              (r) => r.tracking_number.toLowerCase() === metadata.tracking_number.toLowerCase(),
+            )
+          : undefined) ??
+        polled.results?.[0] ??
+        null
+
+      const lookupKey = item?.tracking_number || metadata?.tracking_number || trackingNumber || ''
+      const linkedOrder = metadata?.order_id
+        ? await findStoreOrderForTracking(metadata.order_id)
+        : lookupKey
+          ? await findStoreOrderForTracking(lookupKey)
+          : null
+
+      await saveParcelsTrackingRequest({
+        response: polled,
+        trackingNumber: lookupKey,
+        orderId: linkedOrder?.id ?? metadata?.order_id ?? null,
+        carrierHint: metadata?.carrier_hint ?? linkedOrder?.courier_slug ?? null,
+      })
+
+      if (linkedOrder) {
+        const internalEvents = await loadInternalTimelineEvents(linkedOrder.id)
+        if (item?.shipment && item.state === 'completed') {
+          await syncOrderWithParcelsShipment(linkedOrder, item)
+        }
+
+        if (item) {
+          const mapped = mapParcelsToTrackingResult(
+            item,
+            linkedOrder.tracking_number || linkedOrder.id,
+            {
+              orderId: linkedOrder.id,
+              requestId: polled.request_id,
+              expiresAt: polled.expires_at,
+              internalEvents,
+              defaultCourierName: linkedOrder.courier || undefined,
+              defaultCourierSlug: linkedOrder.courier_slug || undefined,
+            },
+          )
+          return NextResponse.json(mergeOrderWithParcels(linkedOrder, internalEvents, mapped))
+        }
+
+        return NextResponse.json({
+          ...buildBaselineOrderResult(linkedOrder, internalEvents),
+          requestId: polled.request_id,
+          isProcessing: !polled.done,
+          expiresAt: polled.expires_at,
+        })
+      }
+
+      if (item) {
+        return NextResponse.json(
+          mapParcelsToTrackingResult(item, lookupKey || item.tracking_number, {
+            requestId: polled.request_id,
+            expiresAt: polled.expires_at,
+          }),
+        )
+      }
+
+      return NextResponse.json({ error: NOT_FOUND_MESSAGE }, { status: 404 })
+    }
 
     if (!trackingNumber) {
       return NextResponse.json(
@@ -32,132 +256,99 @@ export async function GET(request: NextRequest) {
     }
 
     const cleanKey = trackingNumber.trim()
-    const supabase = createSupabaseAdminClient()
+    const order = await findStoreOrderForTracking(cleanKey)
 
-    // 1. Search store_orders by ID, tracking_number, or reference in notes
-    let query = supabase
-      .from('store_orders')
-      .select('id, status, created_at, courier, tracking_number, delivery_notes, notes, shipping_address, customer_name')
-      .or(`id.ilike.${cleanKey},tracking_number.ilike.${cleanKey}`)
-
-    const { data: matchedOrders, error: orderError } = await query.limit(1)
-
-    if (orderError) {
-      console.error('Error querying order for tracking:', orderError)
-    }
-
-    let order = matchedOrders && matchedOrders.length > 0 ? matchedOrders[0] : null
-
-    // If not found by exact ID or tracking_number, check if cleanKey is matched in notes
-    if (!order) {
-      const { data: notesMatch } = await supabase
-        .from('store_orders')
-        .select('id, status, created_at, courier, tracking_number, delivery_notes, notes, shipping_address, customer_name')
-        .ilike('notes', `%${cleanKey}%`)
-        .limit(1)
-
-      if (notesMatch && notesMatch.length > 0) {
-        order = notesMatch[0]
-      }
-    }
-
-    // ── SCENARIO A: Store Order Found ───────────────────────────────────
+    // ── SCENARIO A: Store Order Found ────────────────────────────────────────
     if (order) {
-      // Fetch timeline entries for this order
-      const { data: timelineEntries, error: timelineError } = await supabase
-        .from('order_timeline_entries')
-        .select('status, created_at, note, actor_name, previous_status')
-        .eq('order_id', order.id)
-        .order('created_at', { ascending: false })
+      const internalEvents = await loadInternalTimelineEvents(order.id)
+      let finalResult = buildBaselineOrderResult(order, internalEvents)
 
-      if (timelineError) {
-        console.error('Error querying timeline for tracking:', timelineError)
-      }
-
-      const rawEvents: TrackingEvent[] = (timelineEntries ?? []).map((entry, index) => ({
-        id: `${order.id}-ev-${index}`,
-        datetime: entry.created_at,
-        status: entry.status,
-        stage: mapOrderStatusToDeliveryStage(entry.status),
-        location: entry.actor_name ? `${SITE_NAME} — ${entry.actor_name}` : `${SITE_NAME} store team`,
-        description: entry.note,
-        source: 'store',
-        recordedBy: entry.actor_name ?? undefined,
-        previousStatus: entry.previous_status ?? undefined,
-      }))
-
-      const filteredEvents = rawEvents.filter((entry) => TRACKABLE_EVENT_STATUSES.has(entry.status))
-      const internalEvents = filteredEvents.length > 0 ? filteredEvents : rawEvents
-
-      const storeStage = mapOrderStatusToDeliveryStage(order.status)
-      const deliveredStage = DELIVERY_STAGES[DELIVERY_STAGES.length - 1]
-
-      // Default baseline result based on store records
-      let finalResult: TrackingResult = {
-        trackingNumber: order.tracking_number || order.id,
-        orderId: order.id,
-        carrier: {
-          code: 'store',
-          name: order.courier || `${SITE_NAME} delivery team`,
-        },
-        status: storeStage,
-        statusText: order.status,
-        estimatedDelivery:
-          storeStage === deliveredStage.stage ? 'Delivered' : 'Updated by our store team',
-        lastUpdated: internalEvents[0]?.datetime ?? order.created_at,
-        events: internalEvents,
-      }
-
-      // If order has an assigned courier waybill, query ParcelsApp for live satellite/courier scans
       if (order.tracking_number && order.tracking_number.trim()) {
         try {
-          const { shipmentResult } = await trackShipmentSync({
+          const { response, shipmentResult } = await trackShipmentSync({
             trackingNumber: order.tracking_number.trim(),
-            carrierHint: order.courier || undefined,
+            carrierHint: order.courier_slug || carrierHintParam || undefined,
             destinationCountry: 'PH',
           })
 
-          if (shipmentResult?.shipment) {
+          await saveParcelsTrackingRequest({
+            response,
+            trackingNumber: order.tracking_number.trim(),
+            orderId: order.id,
+            carrierHint: order.courier_slug || carrierHintParam || null,
+          })
+
+          if (shipmentResult?.shipment && shipmentResult.state === 'completed') {
+            await syncOrderWithParcelsShipment(order, shipmentResult)
+          }
+
+          if (shipmentResult) {
             const merged = mapParcelsToTrackingResult(shipmentResult, order.tracking_number, {
               orderId: order.id,
+              requestId: response.request_id,
+              expiresAt: response.expires_at,
               internalEvents,
               defaultCourierName: order.courier || undefined,
+              defaultCourierSlug: order.courier_slug || undefined,
             })
 
-            // Ensure order stage does not move backwards
-            const storeRank = DELIVERY_STATUS_RANK[order.status] ?? 0
-            const courierRank = DELIVERY_STATUS_RANK[merged.statusText] ?? 0
-
+            finalResult = mergeOrderWithParcels(order, internalEvents, merged)
+          } else {
             finalResult = {
-              ...merged,
-              status: courierRank >= storeRank ? merged.status : storeStage,
-              statusText: courierRank >= storeRank ? merged.statusText : order.status,
-              orderId: order.id,
+              ...finalResult,
+              requestId: response.request_id,
+              isProcessing: !response.done,
+              expiresAt: response.expires_at,
             }
           }
         } catch (parcelsErr) {
-          console.warn('[ParcelsApp Tracking Query]:', parcelsErr)
-          // Continue gracefully with store milestones if courier API is unreachable
+          console.warn('[ParcelsApp v5 Tracking Query]:', parcelsErr)
+          // Continue gracefully with store milestones if courier API is temporarily unavailable
         }
       }
 
       return NextResponse.json(finalResult)
     }
 
-    // ── SCENARIO B: Direct Courier Waybill Search (No local store order) ─
-    // Query ParcelsApp to see if this is an external carrier tracking number
+    // ── SCENARIO B: Direct Courier Waybill Search (No local store order) ─────
     try {
-      const { shipmentResult } = await trackShipmentSync({
+      const { response, shipmentResult, rejected } = await trackShipmentSync({
         trackingNumber: cleanKey,
+        carrierHint: carrierHintParam,
         destinationCountry: 'PH',
       })
 
-      if (shipmentResult?.shipment && (shipmentResult.shipment.states?.length || shipmentResult.shipment.status)) {
-        const courierResult = mapParcelsToTrackingResult(shipmentResult, cleanKey)
+      await saveParcelsTrackingRequest({
+        response,
+        trackingNumber: cleanKey,
+        orderId: null,
+        carrierHint: carrierHintParam || null,
+      })
+
+      if (rejected && !shipmentResult) {
+        return NextResponse.json({ error: rejected.message || NOT_FOUND_MESSAGE }, { status: 400 })
+      }
+
+      if (
+        shipmentResult &&
+        (shipmentResult.state === 'processing' ||
+          shipmentResult.shipment?.states?.length ||
+          shipmentResult.shipment?.status ||
+          shipmentResult.shipment?.error)
+      ) {
+        const courierResult = mapParcelsToTrackingResult(shipmentResult, cleanKey, {
+          requestId: response.request_id,
+          expiresAt: response.expires_at,
+          defaultCourierSlug: carrierHintParam,
+        })
         return NextResponse.json(courierResult)
       }
     } catch (parcelsErr) {
-      console.warn('[Direct ParcelsApp Lookup Error]:', parcelsErr)
+      if (parcelsErr instanceof ParcelsApiError) {
+        console.warn('[Direct ParcelsApp v5 Lookup Error]:', parcelsErr.code, parcelsErr.message)
+      } else {
+        console.warn('[Direct ParcelsApp v5 Lookup Error]:', parcelsErr)
+      }
     }
 
     return NextResponse.json({ error: NOT_FOUND_MESSAGE }, { status: 404 })

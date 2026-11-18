@@ -44,3 +44,26 @@ export async function fetchTrackingInfo(trackingNumber: string): Promise<Trackin
 
   return payload as TrackingResult
 }
+
+/**
+ * Polls an active asynchronous Parcels v5 lookup by its temporary `requestId`.
+ */
+export async function pollTrackingRequest(requestId: string): Promise<TrackingResult> {
+  const trimmed = requestId.trim()
+  if (!trimmed) {
+    throw new Error('Request ID is required to poll tracking.')
+  }
+
+  const res = await fetch(`/api/track?requestId=${encodeURIComponent(trimmed)}`, {
+    headers: await getAuthHeaders(),
+    cache: 'no-store',
+  })
+
+  const payload = await res.json().catch(() => null)
+
+  if (!res.ok) {
+    throw new Error(payload?.error || 'Unable to refresh tracking request.')
+  }
+
+  return payload as TrackingResult
+}

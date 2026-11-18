@@ -1,10 +1,10 @@
 'use client'
 
 import { useMemo, useState } from 'react'
-import { RefreshCw } from 'lucide-react'
+import { ArrowLeft, Package, RefreshCw, Truck } from 'lucide-react'
 import Image from 'next/image'
 import Link from 'next/link'
-import { ArrowLeft } from 'lucide-react'
+import { getBrowserAuthHeaders } from '@/lib/client-auth-headers'
 import { Button } from '@/components/ui/button'
 import { ProtectedRoute } from '@/components/protected-route'
 import { AdminSidebar } from '@/components/admin-sidebar'
@@ -127,6 +127,7 @@ export default function AdminOrdersPage() {
   const [adminCancelOrderTarget, setAdminCancelOrderTarget] = useState<OrderRecord | null>(null)
   const [adminCancelReason, setAdminCancelReason] = useState('')
   const [isAdminCancelling, setIsAdminCancelling] = useState(false)
+  const [isSyncingDeliveries, setIsSyncingDeliveries] = useState(false)
 
   const counts = useMemo(() => {
     return {
@@ -300,6 +301,43 @@ export default function AdminOrdersPage() {
     }
   }
 
+  const handleSyncDeliveries = async () => {
+    try {
+      setIsSyncingDeliveries(true)
+      const headers = await getBrowserAuthHeaders()
+      const response = await fetch('/api/admin/delivery/sync', {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json',
+        },
+      })
+
+      const result = (await response.json().catch(() => null)) as {
+        ok?: boolean
+        message?: string
+        error?: string
+      } | null
+
+      if (!response.ok || !result?.ok) {
+        throw new Error(result?.error ?? result?.message ?? 'Courier sync failed.')
+      }
+
+      toast({
+        title: 'Courier sync complete',
+        description: result.message || 'Active shipments checked against Parcels API v5.',
+      })
+    } catch (error) {
+      toast({
+        title: 'Courier sync failed',
+        description: error instanceof Error ? error.message : 'Unable to synchronize deliveries.',
+        variant: 'destructive',
+      })
+    } finally {
+      setIsSyncingDeliveries(false)
+    }
+  }
+
   return (
     <ProtectedRoute requiredRole={['ADMIN', 'STAFF']}>
       <div className="flex min-h-screen bg-background">
@@ -361,6 +399,19 @@ export default function AdminOrdersPage() {
                       </option>
                     ))}
                   </select>
+                  {user?.role === 'ADMIN' && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isSyncingDeliveries}
+                      onClick={handleSyncDeliveries}
+                      className="h-9 gap-1.5 rounded-xl border-border text-xs font-medium"
+                    >
+                      <RefreshCw className={`h-3.5 w-3.5 ${isSyncingDeliveries ? 'animate-spin' : ''}`} />
+                      {isSyncingDeliveries ? 'Syncing...' : 'Sync Courier Updates'}
+                    </Button>
+                  )}
                 </div>
               </div>
 
@@ -509,6 +560,21 @@ export default function AdminOrdersPage() {
                           <span className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold ${getStatusTone(order.status)}`}>
                             {order.status}
                           </span>
+                          {(order.courier || order.trackingNumber) && (
+                            <div className="mt-2 space-y-0.5 text-xs text-foreground/70">
+                              {order.courier && (
+                                <p className="inline-flex items-center gap-1 font-medium text-foreground">
+                                  <Truck className="h-3 w-3 text-muted-foreground" />
+                                  {order.courier}
+                                </p>
+                              )}
+                              {order.trackingNumber && (
+                                <p className="font-mono text-[11px] text-muted-foreground select-all">
+                                  {order.trackingNumber}
+                                </p>
+                              )}
+                            </div>
+                          )}
                         </td>
                         <td className="py-4 px-6">
                           {getLastTimelineEntry(order) ? (
@@ -616,9 +682,10 @@ export default function AdminOrdersPage() {
                                 <Link
                                   href={`/track?num=${encodeURIComponent(order.trackingNumber || order.id)}`}
                                   target="_blank"
-                                  className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
+                                  className="inline-flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"
                                 >
-                                  📦 View Live Tracking
+                                  <Package className="h-3.5 w-3.5" />
+                                  View Live Tracking
                                 </Link>
                               </div>
                             )}

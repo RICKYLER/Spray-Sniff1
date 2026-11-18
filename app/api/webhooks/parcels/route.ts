@@ -1,15 +1,14 @@
 import { NextResponse } from 'next/server'
-import { getOptionalServerEnv } from '@/lib/server-runtime-env'
 import { createSupabaseAdminClient } from '@/lib/supabase-server'
-import {
-  DELIVERY_STATUS_RANK,
-  mapDeliveryStageToOrderStatus,
-  mapParcelsStateToDeliveryStage,
-} from '@/lib/tracking-types'
 import {
   verifyParcelsWebhookSignature,
   type ParcelsTrackingResultItem,
 } from '@/lib/parcels-api'
+import {
+  getParcelsWebhookSecret,
+  saveParcelsTrackingRequest,
+  syncOrderWithParcelsShipment,
+} from '@/lib/tracking-sync'
 
 interface ParcelsWebhookPayload {
   event: 'shipment_completed' | 'batch_completed' | 'tracking_error'
@@ -24,45 +23,49 @@ interface ParcelsWebhookPayload {
   }
 }
 
+function isMissingCourierSlugError(error: { code?: string; message?: string } | null | undefined) {
+  if (!error) return false
+  const msg = (error.message || '').toLowerCase()
+  return error.code === '42703' || error.code === 'PGRST204' || msg.includes('courier_slug')
+}
+
 /**
- * ParcelsApp Webhook Endpoint
+ * ParcelsApp v5 Webhook Endpoint
  *
- * Receives signed courier milestone and completion notifications from ParcelsApp.
- * When a courier marks an order as In Transit, Out for Delivery, or Delivered,
- * this route verifies the HMAC-SHA256 signature and automatically advances
- * the store order's delivery status with an audit timeline record.
+ * Receives signed completion notifications for a single `POST /trackings` request.
+ * Verifies the `Parcels-Signature` HMAC-SHA256 header (`t=<unix>,v1=<hex>`) using
+ * the per-request `webhook.secret` stored in `parcels_tracking_requests` (falling back
+ * to `PARCELS_WEBHOOK_SECRET`), then synchronizes forward-only status and deduplicated
+ * checkpoints onto `store_orders` and `order_timeline_entries`.
  */
 export async function POST(req: Request) {
-  const secret = getOptionalServerEnv('PARCELS_WEBHOOK_SECRET')
   const signatureHeader = req.headers.get('parcels-signature')
-
   const rawBody = await req.text()
-
-  // Verify HMAC-SHA256 signature if secret is configured
-  if (secret) {
-    const { valid, reason } = verifyParcelsWebhookSignature(rawBody, signatureHeader, secret)
-    if (!valid) {
-      console.warn('[ParcelsApp Webhook Rejected]:', reason)
-      return NextResponse.json({ error: reason || 'Unauthorized' }, { status: 401 })
-    }
-  } else {
-    // In local development / mock testing without secret configured, log notice
-    console.info('[ParcelsApp Webhook]: Running without PARCELS_WEBHOOK_SECRET configured.')
-  }
 
   let payload: ParcelsWebhookPayload
   try {
-    payload = JSON.parse(rawBody)
+    payload = JSON.parse(rawBody) as ParcelsWebhookPayload
   } catch {
     return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 })
   }
 
+  const secret = await getParcelsWebhookSecret(payload.request_id)
+
+  if (secret) {
+    const { valid, reason } = verifyParcelsWebhookSignature(rawBody, signatureHeader, secret)
+    if (!valid) {
+      console.warn('[ParcelsApp v5 Webhook Rejected]:', reason)
+      return NextResponse.json({ error: reason || 'Unauthorized' }, { status: 401 })
+    }
+  } else {
+    console.info('[ParcelsApp v5 Webhook]: No per-request or fallback PARCELS_WEBHOOK_SECRET found.')
+  }
+
   if (payload.event === 'tracking_error') {
-    console.warn('[ParcelsApp Tracking Error Event]:', payload.error)
+    console.warn('[ParcelsApp v5 Tracking Error Event]:', payload.error)
     return NextResponse.json({ received: true, acknowledged: 'tracking_error' })
   }
 
-  // Collect all completed results from single or batch payload
   const items: ParcelsTrackingResultItem[] = []
   if (payload.result) {
     items.push(payload.result)
@@ -82,82 +85,37 @@ export async function POST(req: Request) {
     const trackingNumber = item.tracking_number?.trim()
     if (!trackingNumber) continue
 
-    // Find the order with matching courier tracking number
-    const { data: orders, error: findErr } = await supabase
+    await saveParcelsTrackingRequest({
+      response: {
+        request_id: payload.request_id,
+        status: payload.done ? 'completed' : 'processing',
+        done: payload.done,
+        results: [item],
+      },
+      trackingNumber,
+    })
+
+    let findRes = await supabase
       .from('store_orders')
-      .select('id, status, payment_method, payment_status, courier, notes')
+      .select('id, status, courier, courier_slug')
       .ilike('tracking_number', trackingNumber)
       .limit(1)
 
-    if (findErr || !orders || orders.length === 0) {
-      // Waybill is not assigned to a local store order (e.g. external package)
+    if (findRes.error && isMissingCourierSlugError(findRes.error)) {
+      findRes = await supabase
+        .from('store_orders')
+        .select('id, status, courier')
+        .ilike('tracking_number', trackingNumber)
+        .limit(1) as typeof findRes
+    }
+
+    const order = findRes.data?.[0]
+    if (!order) {
       continue
     }
 
-    const order = orders[0]
-    const shipment = item.shipment
-    const rawStatus = shipment?.status || shipment?.states?.[0]?.state || item.state
-    const detectedStage = mapParcelsStateToDeliveryStage(rawStatus)
-    const newOrderStatus = mapDeliveryStageToOrderStatus(detectedStage)
-
-    const carrierName =
-      shipment?.detectedCarrier?.name ||
-      shipment?.services?.[0]?.name ||
-      order.courier ||
-      'Courier'
-
-    const latestCheckpoint = shipment?.states?.[0]
-    const checkpointText = latestCheckpoint
-      ? `${latestCheckpoint.state}${latestCheckpoint.location ? ` (${latestCheckpoint.location})` : ''}`
-      : `Courier status: ${rawStatus}`
-
-    const currentRank = DELIVERY_STATUS_RANK[order.status] ?? 0
-    const nextRank = newOrderStatus ? (DELIVERY_STATUS_RANK[newOrderStatus] ?? 0) : 0
-
-    // Advance status only if it moves strictly forward
-    if (newOrderStatus && nextRank > currentRank) {
-      const now = new Date().toISOString()
-
-      // Update store order status
-      const { error: updateErr } = await supabase
-        .from('store_orders')
-        .update({
-          status: newOrderStatus,
-          updated_at: now,
-        })
-        .eq('id', order.id)
-
-      if (updateErr) {
-        console.error(`Failed to update order ${order.id} status to ${newOrderStatus}:`, updateErr)
-      } else {
-        // Record timeline entry for customer and audit trail
-        const timelineId = `${order.id}-ev-${Date.now()}`
-        await supabase.from('order_timeline_entries').insert({
-          id: timelineId,
-          order_id: order.id,
-          status: newOrderStatus,
-          created_at: now,
-          actor_name: `${carrierName} (Auto-sync)`,
-          previous_status: order.status,
-          note: checkpointText,
-        })
-
-        processedCount++
-        console.log(`[ParcelsApp Sync] Order ${order.id} automatically advanced to ${newOrderStatus} via ${carrierName}.`)
-      }
-    } else if (latestCheckpoint) {
-      // Status remains the same stage (e.g. In Transit at another hub), but record intermediate checkpoint
-      const now = new Date().toISOString()
-      const timelineId = `${order.id}-ev-${Date.now()}`
-      await supabase.from('order_timeline_entries').insert({
-        id: timelineId,
-        order_id: order.id,
-        status: order.status,
-        created_at: now,
-        actor_name: `${carrierName} (Auto-sync)`,
-        previous_status: order.status,
-        note: checkpointText,
-      })
+    const syncResult = await syncOrderWithParcelsShipment(order, item)
+    if (syncResult.updatedStatus || syncResult.recordedCheckpoint) {
       processedCount++
     }
   }

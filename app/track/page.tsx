@@ -6,7 +6,7 @@ import Link from 'next/link'
 import { StorefrontShell } from '@/components/storefront-shell'
 import { StorefrontPageHero } from '@/components/storefront-page-hero'
 import { TrackingTimeline } from '@/components/tracking-timeline'
-import { fetchTrackingInfo } from '@/lib/tracking-service'
+import { fetchTrackingInfo, pollTrackingRequest } from '@/lib/tracking-service'
 import type { TrackingResult } from '@/lib/tracking-types'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -61,6 +61,41 @@ function TrackContent() {
       handleSearch(initialNumber)
     }
   }, [initialNumber])
+
+  // Auto-poll active asynchronous Parcels v5 request while processing
+  useEffect(() => {
+    const reqId = trackingData?.requestId
+    if (!trackingData?.isProcessing || !reqId) return
+
+    let cancelled = false
+    let attempts = 0
+    const maxAttempts = 6
+
+    const timer = setInterval(async () => {
+      attempts += 1
+      if (cancelled || attempts > maxAttempts) {
+        clearInterval(timer)
+        return
+      }
+
+      try {
+        const updated = await pollTrackingRequest(reqId)
+        if (!cancelled) {
+          setTrackingData(updated)
+          if (!updated.isProcessing) {
+            clearInterval(timer)
+          }
+        }
+      } catch {
+        clearInterval(timer)
+      }
+    }, 2500)
+
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [trackingData?.isProcessing, trackingData?.requestId])
 
   return (
     <div className="container max-w-4xl mx-auto px-4 py-8 md:py-12">

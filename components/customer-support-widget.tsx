@@ -32,6 +32,8 @@ import type { OrderRecord } from '@/lib/store-context'
 import type {
   SupportBootstrapPayload,
   SupportCase,
+  SupportChatResponse,
+  SupportChatTurn,
   SupportFaq,
   SupportQuickAction,
 } from '@/lib/support-types'
@@ -277,6 +279,7 @@ export function CustomerSupportWidget() {
     }
 
     return [
+      { id: 'prompt-scent', label: 'Recommend perfume', text: 'What is the best perfume you recommend?' },
       { id: 'prompt-admin', label: 'Connect to Admin', actionId: 'escalate_to_admin' },
       { id: 'prompt-track', label: 'Track order', actionId: 'track_order' },
       { id: 'prompt-refund', label: 'Request refund', actionId: 'request_refund' },
@@ -284,19 +287,32 @@ export function CustomerSupportWidget() {
     ]
   }, [activeCaseId, bootstrap?.isAuthenticated])
 
+  const buildChatHistory = (currentMessages: ChatMessage[]): SupportChatTurn[] =>
+    currentMessages
+      .filter(
+        (msg): msg is BaseChatMessage & { kind: 'text' } =>
+          msg.kind === 'text' && (msg.role === 'customer' || msg.role === 'bot') && msg.text.trim().length > 0,
+      )
+      .slice(-12)
+      .map((msg) => ({
+        role: msg.role === 'customer' ? 'user' : 'assistant',
+        content: msg.text,
+        createdAt: msg.createdAt,
+      }))
+
   const composerLocked = !bootstrap?.isAuthenticated
   const composerPlaceholder = composerLocked
     ? 'Sign in to ask about your order...'
     : activeCaseId
       ? 'Reply to this support case...'
-      : 'Ask anything about your order...'
+      : 'Ask our AI Concierge anything...'
   const composerCaption = composerLocked
     ? 'Guest preview mode'
     : activeCaseId
       ? `Replying to ${activeCaseId}`
       : composerOrderId
-        ? `Linking ${composerOrderId}`
-        : 'New guided support request'
+        ? `Linking ${composerOrderId} · AI Concierge`
+        : 'AI Concierge · Chat with bot first'
 
   const appendMessage = (message: ChatMessage) => {
     setMessages((currentMessages) => [...currentMessages, message])
@@ -581,6 +597,7 @@ export function CustomerSupportWidget() {
           category: composerOrderId ? 'order_help' : 'general',
           orderId: composerOrderId ?? undefined,
           message: 'Customer requested human admin assistance from support desk.',
+          history: buildChatHistory(messages),
         })
         if (result.case) {
           setActiveCaseId(result.case.id)
@@ -789,6 +806,7 @@ export function CustomerSupportWidget() {
       return
     }
 
+    const history = buildChatHistory(messages)
     appendTextMessage('customer', trimmedMessage)
     setDraftMessage('')
     setPendingAction('composer')
@@ -823,24 +841,36 @@ export function CustomerSupportWidget() {
         if (lastMsg && (lastMsg.authorType === 'bot' || lastMsg.authorType === 'staff')) {
           appendTextMessage(lastMsg.authorType, lastMsg.message, lastMsg.authorName)
         } else {
-          appendTextMessage('system', 'Your reply has been added to the support thread.')
+          appendTextMessage('system', 'Your message has been delivered to our Admin team.')
         }
       } else {
-        const result = await callSupportAction({
-          action: 'createSupportCase',
-          category: composerOrderId ? 'order_help' : 'general',
-          orderId: composerOrderId ?? undefined,
-          message: trimmedMessage,
+        const response = await fetch('/api/support/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(await getBrowserAuthHeaders()),
+          },
+          body: JSON.stringify({
+            message: trimmedMessage,
+            history,
+            orderId: composerOrderId ?? undefined,
+          }),
         })
+        const payload = (await response.json().catch(() => null)) as
+          | (SupportChatResponse & { error?: string })
+          | null
 
-        if (!result.case) {
-          throw new Error(result.message)
+        if (!response.ok || !payload?.reply) {
+          throw new Error(payload?.error ?? 'Unable to reach the concierge right now.')
         }
 
-        setActiveCaseId(result.case.id)
-        setComposerMode('reply')
-        await loadBootstrap()
-        appendTextMessage('bot', result.message)
+        if (payload.escalated && payload.case) {
+          setActiveCaseId(payload.case.id)
+          setComposerMode('reply')
+          await loadBootstrap()
+        }
+
+        appendTextMessage('bot', payload.reply)
       }
     } catch (error) {
       appendTextMessage(

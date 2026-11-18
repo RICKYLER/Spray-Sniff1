@@ -810,8 +810,9 @@ function OrdersContent() {
                               asChild
                               className="h-8 rounded-xl border-border/80 bg-white text-xs font-semibold hover:border-primary/50 shrink-0"
                             >
-                              <Link href={`/track?num=${encodeURIComponent(order.trackingNumber || order.id)}`}>
-                                Track Parcel 🚚
+                              <Link href={`/track?num=${encodeURIComponent(order.trackingNumber || order.id)}`} className="inline-flex items-center gap-1.5">
+                                <Truck className="h-3.5 w-3.5" />
+                                Track Parcel
                               </Link>
                             </Button>
                           </div>

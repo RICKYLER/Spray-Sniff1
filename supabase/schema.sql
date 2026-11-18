@@ -118,18 +118,24 @@ create table if not exists public.store_orders (
   notes text null,
   -- Delivery & Courier fulfillment details. Managed by ADMIN / logistics.
   courier text null,
+  courier_slug text null,
   tracking_number text null,
-  delivery_notes text null
+  delivery_notes text null,
+  parcels_last_synced_at timestamptz null
 );
 
 alter table public.store_orders
   add column if not exists courier text null,
+  add column if not exists courier_slug text null,
   add column if not exists tracking_number text null,
-  add column if not exists delivery_notes text null;
+  add column if not exists delivery_notes text null,
+  add column if not exists parcels_last_synced_at timestamptz null;
 
 comment on column public.store_orders.courier is 'Courier partner name (e.g., LBC, J&T Express, Ninja Van)';
+comment on column public.store_orders.courier_slug is 'Canonical Parcels API v5 carrier slug accepted by carrier_hint';
 comment on column public.store_orders.tracking_number is 'Waybill / tracking number issued by the courier partner';
 comment on column public.store_orders.delivery_notes is 'Special delivery instructions or logistics updates';
+comment on column public.store_orders.parcels_last_synced_at is 'Timestamp of the most recent live sync from Parcels API v5';
 
 create index if not exists store_orders_tracking_number_idx
   on public.store_orders (lower(tracking_number))
@@ -294,6 +300,26 @@ create table if not exists public.support_messages (
   created_at timestamptz not null default timezone('utc', now()),
   updated_at timestamptz not null default timezone('utc', now())
 );
+
+create table if not exists public.parcels_tracking_requests (
+  request_id text primary key,
+  tracking_number text not null,
+  order_id text null references public.store_orders (id) on delete set null,
+  carrier_hint text null,
+  webhook_secret text null,
+  status text not null default 'processing' check (status in ('processing', 'completed', 'error')),
+  expires_at timestamptz null,
+  last_payload jsonb null,
+  created_at timestamptz not null default timezone('utc', now()),
+  updated_at timestamptz not null default timezone('utc', now())
+);
+
+create index if not exists idx_parcels_tracking_requests_tracking_number
+  on public.parcels_tracking_requests (lower(tracking_number), created_at desc);
+
+create index if not exists idx_parcels_tracking_requests_order_id
+  on public.parcels_tracking_requests (order_id, created_at desc)
+  where order_id is not null;
 
 create or replace function public.set_updated_at()
 returns trigger
@@ -469,6 +495,20 @@ alter table public.product_categories enable row level security;
 alter table public.product_reviews enable row level security;
 alter table public.support_cases enable row level security;
 alter table public.support_messages enable row level security;
+alter table public.parcels_tracking_requests enable row level security;
+
+drop trigger if exists set_parcels_tracking_requests_updated_at on public.parcels_tracking_requests;
+create trigger set_parcels_tracking_requests_updated_at
+before update on public.parcels_tracking_requests
+for each row
+execute function public.set_updated_at();
+
+drop policy if exists "parcels_tracking_requests_select_backoffice" on public.parcels_tracking_requests;
+create policy "parcels_tracking_requests_select_backoffice"
+on public.parcels_tracking_requests
+for select
+to authenticated
+using (public.is_backoffice_user());
 
 drop policy if exists "profiles_select_own" on public.profiles;
 create policy "profiles_select_own"
